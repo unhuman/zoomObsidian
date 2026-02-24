@@ -1,0 +1,19 @@
+node_modules/
+build/
+.env
+package-lock.json
+package-lock.json
+
+# macOS metadata
+.DS_Store
+
+# Editor / IDE
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local cache files written by this tool
+.zoom-mcp/
+

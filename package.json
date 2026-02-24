@@ -1,0 +1,31 @@
+{
+  "name": "zoom-meeting-summaries-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for fetching Zoom meeting summaries via browser-based authentication",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "zoom-meeting-summaries-mcp": "build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "zoom",
+    "meeting-summaries"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "puppeteer": "^24.37.5",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}
