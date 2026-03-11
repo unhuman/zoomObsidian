@@ -3,11 +3,11 @@
  *
  * The Zoom meeting summary page is a SPA — the table is populated by
  * client-side JavaScript. Plain HTTP requests return empty HTML.
- * For listing and nav-ID resolution we use a hidden Electron BrowserWindow
- * (with the authenticated session partition) to load the SPA, wait for it
- * to render, then extract data via webContents.executeJavaScript().
+ * For listing, nav-ID resolution, and deletion we use a hidden Electron
+ * BrowserWindow (with the authenticated session partition) to load the SPA,
+ * wait for it to render, then interact via webContents.executeJavaScript().
  *
- * Summary detail and deletion still use direct REST endpoints via nodeRequest().
+ * Summary detail uses direct REST endpoints via nodeRequest().
  *
  * All caches (navIdCache) are in-memory only.
  */
