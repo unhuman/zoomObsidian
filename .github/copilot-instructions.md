@@ -1,6 +1,19 @@
 # Copilot Instructions
 
+## Project Overview
+
+This repo contains **two independent implementations** of the same Zoom-meeting-summaries-to-Obsidian workflow:
+
+1. **MCP server + standalone script** (root-level `src/` and `zoom-meetings-to-obsidian.mjs`) — Puppeteer-based, runs outside Obsidian.
+2. **Obsidian plugin** (`ObsidianPlugin/`) — self-contained desktop plugin, uses Electron BrowserWindow + direct fetch() instead of Puppeteer.
+
+Both share the same core logic (listing, matching, writing, deleting) but are architecturally independent — neither depends on the other.
+
+---
+
 ## Build & Run
+
+### MCP Server (root)
 
 ```bash
 npm run build        # Compile TypeScript → build/
@@ -8,9 +21,22 @@ npm run dev          # Watch mode (tsc --watch)
 npm start            # Run the MCP server (stdio transport)
 ```
 
-No test suite or linter is configured.
+### Obsidian Plugin
 
-## Architecture
+```bash
+cd ObsidianPlugin
+npm install
+npm run build        # esbuild → main.js (CJS bundle)
+npm run dev          # Watch mode with auto-rebuild
+```
+
+Install by copying `manifest.json`, `main.js`, and `styles.css` into `<vault>/.obsidian/plugins/zoom-obsidian/`. See `ObsidianPlugin/README.md` for full instructions.
+
+No test suite or linter is configured for either project.
+
+---
+
+## Architecture — MCP Server (root `src/`)
 
 This is an MCP (Model Context Protocol) server that exposes Zoom meeting summaries as tools and writes them into an Obsidian vault. It uses **Puppeteer web scraping** (not the Zoom REST API) with browser-based cookie authentication.
 
@@ -31,8 +57,36 @@ This is an MCP (Model Context Protocol) server that exposes Zoom meeting summari
 
 **Dry-run script:** `zoom-meetings-to-obsidian.mjs` is a standalone ESM script that copies vault files to `/tmp/obsidian-preview` and applies mutations there. It skips copying files that already exist in `/tmp` (preserving previous runs for idempotency testing). After writing, it logs a `Would delete from Zoom` list instead of actually deleting. Pass `--update` to write to the real vault. Pass `--update --delete` to also delete summaries from Zoom. `--delete` without `--update` is an error. Pass `--debug` to enable verbose diagnostic logging (page element dumps, network request traces, CSRF probing, row-scan results).
 
+---
+
+## Architecture — Obsidian Plugin (`ObsidianPlugin/`)
+
+A self-contained Obsidian community plugin (desktop-only, `isDesktopOnly: true`). Replaces Puppeteer with Electron BrowserWindow for auth, uses direct `fetch()` with cookies for Zoom API calls, and the Obsidian `Vault` API for file I/O. Plugin settings UI replaces env vars and CLI flags.
+
+**Seven-module design:**
+
+- `src/main.ts` — Plugin entry point (extends `Plugin`). Registers four commands (`sync`, `login`, `list`, `logout`), a ribbon icon, and the settings tab. Contains `SyncReportModal` and `SummaryListModal` modal classes.
+- `src/settings.ts` — `ZoomObsidianSettingTab`. Sections: Zoom Connection (subdomain, login/logout buttons), Vault Layout (subfolder, 1:1 folders), Sync Behavior (auto-delete, topic filter), Advanced (debug toggle).
+- `src/types.ts` — All shared interfaces: `MeetingSummaryItem`, `MeetingSummaryDetail`, `SummarySection`, `NextStepItem`, `ZoomSummaryData`, `NavIdEntry`, `ZoomObsidianSettings`, `SerializedCookie`, and `DEFAULT_SETTINGS` constant.
+- `src/node-http.ts` — `nodeRequest()` helper. Wraps Node.js `https`/`http` modules in a Promise-based API. Required because Electron's renderer-process `fetch()` silently strips the `Cookie` header (forbidden header per Fetch spec). Supports `followRedirects` option for manual redirect handling.
+- `src/zoom-auth.ts` — `ZoomAuth` class. Opens Electron `BrowserWindow` with `persist:zoom-obsidian` session partition for Zoom SSO/password login. Extracts cookies after redirect, persists via callback. `isAuthenticated()` uses `nodeRequest()` with `followRedirects: false` to detect login redirects. Accessed via `require("electron").remote`.
+- `src/zoom-client.ts` — `ZoomClient` class. Uses a hidden `BrowserWindow` (with authenticated session partition) for SPA scraping — Zoom's summary page is client-rendered and plain HTTP gets empty HTML. `listSummaries()` loads the SPA, waits for the table to render, extracts rows via `executeJavaScript()`, and paginates by clicking Next. `resolveNavId()`/`prefetchNavIds()` click topic rows in the SPA to capture UUID+summaryId from hash navigation. `zoomFetch()` helper uses `nodeRequest()` for direct REST calls (summary detail). `getSummary()` calls `/rest/meeting/web_view_summary`. `deleteSummary()` uses the hidden BrowserWindow: navigates to the detail hash, clicks the delete button (aria-label `"delete meeting summary"`), waits for "Move to Trash" confirmation dialog, clicks confirm, and falls back to `fetch()` inside the browser context (which has session cookies and CSRF tokens) if the UI flow doesn't confirm. Hidden window is cleaned up after each operation via `closeScrapeWindow()`.
+- `src/vault-writer.ts` — `VaultWriter` class. Ported from `ObsidianClient`. Uses `app.vault.read/modify/create/getAbstractFileByPath`. File matching: exact full name → starts-with first name → contains as word (4-priority system). Chronological newest-first insertion with same-date merge and idempotency.
+- `src/sync-orchestrator.ts` — `SyncOrchestrator` class. 7-phase workflow: list meetings → resolve attendees → build plan → prefetch nav IDs + summaries → write to vault → optionally delete from Zoom → report. In-memory `attendeesCache` and `summaryCache`. Progress callbacks for UI notices.
+
+**Build tooling:** esbuild bundling to CJS (`main.js`), externals: `obsidian`, `electron`, `@electron/remote`, Node built-in modules. TypeScript strict mode, ES2022 target, bundler module resolution.
+
+**Settings persistence:** Plugin settings stored in `data.json` via Obsidian's `saveData()`/`loadData()`. Includes serialized Zoom cookies (no external cookie file needed).
+
+---
+
 ## Key Conventions
 
+### General (both projects)
+- All caches (`attendeesCache`, `summaryCache`, `navIdCache`) are **in-memory only** — never persisted to disk. They exist solely to avoid duplicate fetches within a single run.
+- Multi-person meetings (3+ participants or `A:B:C` topic with 2+ non-Howard names) are skipped — only 1:1s are written to Obsidian.
+
+### MCP Server (root)
 - ESM throughout (`"type": "module"` in package.json, Node16 module resolution). All local imports use `.js` extensions.
 - All MCP tool handlers return `{ content: [{ type: "text", text: ... }] }` shape with `isError: true` on failure. Error messages suggest calling `zoom_login` first.
 - Diagnostic/log output goes to `console.error` (stdout is reserved for MCP stdio transport). `zoom-meetings-to-obsidian.mjs` uses `console.log` for all user-facing output (table + would-delete list) and `process.stderr.write` for progress noise.
@@ -41,9 +95,18 @@ This is an MCP (Model Context Protocol) server that exposes Zoom meeting summari
 - The `VAULT_SUBFOLDER` env var names the subfolder within the vault containing 1:1 note directories (e.g. `MyOrg`). Leave empty to search directly under vault root.
 - The `ONE_ON_ONE_FOLDERS` env var is a comma-separated list of folder names holding 1:1 notes (default: `! One on Ones,! One on Ones (Other)`).
 - The standalone script resolves each setting via: env var → `~/.zoom-mcp/config.json` → interactive prompt (with optional save). Config keys: `vaultPath`, `zoomSubdomain`, `vaultSubfolder`, `oneOnOneFolders`.
-- All caches (`attendeesCache`, `summaryCache`, `navIdCache`) are **in-memory only** — never persisted to disk. They exist solely to avoid duplicate fetches within a single run. No disk caches are written; `~/.zoom-mcp/` only holds `cookies.json` and optionally `config.json` (vault path).
-- Multi-person meetings (3+ participants or `A:B:C` topic with 2+ non-Howard names) are skipped — only 1:1s are written to Obsidian.
+- No disk caches are written; `~/.zoom-mcp/` only holds `cookies.json` and optionally `config.json` (vault path).
+
+### Obsidian Plugin
+- TypeScript with esbuild bundler (not tsc for emit). CJS output format (Obsidian requirement). Externalized: `obsidian`, `electron`, `@electron/remote`, Node built-in modules.
+- **HTTP requests must use `nodeRequest()` from `node-http.ts`**, not `fetch()`. Electron's renderer-process `fetch()` silently strips the `Cookie` header (forbidden per Fetch spec), breaking all authenticated Zoom requests. `nodeRequest()` wraps Node.js `https`/`http` modules which have no such restriction.
+- Plugin settings replace env vars — configured via Obsidian's Settings UI (`ZoomObsidianSettingTab`).
+- Electron BrowserWindow accessed via `require("electron").remote` (available in Obsidian desktop).
+- Cookies persisted in plugin `data.json` via Obsidian `saveData()`. No external cookie file.
+- Debug logging uses `console.log` with `[zoom-*]` prefixes (visible in Obsidian developer console).
+- Desktop-only — `manifest.json` sets `isDesktopOnly: true`.
 
 ## Documentation
 - Always update documentation with every change
-- ensure the help in the script file(s) is kept up to date
+- Ensure the help in the script file(s) is kept up to date
+- Plugin documentation lives in `ObsidianPlugin/README.md` — update it when changing plugin behavior, commands, settings, or build steps

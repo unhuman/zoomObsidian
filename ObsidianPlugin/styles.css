@@ -1,0 +1,29 @@
+/* Zoom Meeting Summaries plugin styles */
+
+.zoom-sync-modal .zoom-sync-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1em 0;
+}
+
+.zoom-sync-modal .zoom-sync-table th,
+.zoom-sync-modal .zoom-sync-table td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.zoom-sync-modal .zoom-sync-table th {
+  font-weight: 600;
+}
+
+.zoom-sync-modal .zoom-sync-status {
+  margin: 0.5em 0;
+}
+
+.zoom-sync-modal .zoom-sync-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 1em;
+}
