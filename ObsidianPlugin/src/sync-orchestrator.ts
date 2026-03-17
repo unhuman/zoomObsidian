@@ -43,8 +43,9 @@ export interface SyncReport {
   deleted: number;
   deleteFailed: number;
   /** Updated scan timestamps — caller should persist these. */
-  updatedLastProcessedOwned?: string;
   updatedLastProcessedShared?: string;
+  /** Latest meeting date (YYYY-MM-DD) seen in this source's plan. */
+  latestMeetingDate?: string;
 }
 
 export class SyncOrchestrator {
@@ -60,8 +61,7 @@ export class SyncOrchestrator {
   /** Progress callback for UI updates. */
   onProgress?: (message: string) => void;
 
-  /** Last-processed timestamps for incremental scans. */
-  private lastProcessedOwned?: string;
+  /** Last-processed timestamp for incremental shared-meeting scans. */
   private lastProcessedShared?: string;
 
   constructor(
@@ -70,7 +70,6 @@ export class SyncOrchestrator {
     opts?: {
       debug?: boolean;
       sharedMeetingsFolder?: string;
-      lastProcessedOwned?: string;
       lastProcessedShared?: string;
     }
   ) {
@@ -78,7 +77,6 @@ export class SyncOrchestrator {
     this.writer = writer;
     this.debug = opts?.debug ?? false;
     this.sharedMeetingsFolder = opts?.sharedMeetingsFolder;
-    this.lastProcessedOwned = opts?.lastProcessedOwned;
     this.lastProcessedShared = opts?.lastProcessedShared;
   }
 
@@ -120,28 +118,27 @@ export class SyncOrchestrator {
     const runTimestamp = new Date().toISOString();
 
     this.dbg(`[scan-dates] Run starting at ${runTimestamp}`);
-    this.dbg(`[scan-dates] lastProcessedOwned=${this.lastProcessedOwned ?? "(none)"}, lastProcessedShared=${this.lastProcessedShared ?? "(none)"}`);
+    this.dbg(`[scan-dates] lastProcessedShared=${this.lastProcessedShared ?? "(none)"} (owned: always full scan)`);
     this.dbg(`[scan-dates] filter=${filter || "(none)"}, autoDelete=${autoDelete}, hasSharedFolder=${hasSharedFolder}`);
 
-    // Process owned meetings only when shared-only mode is not enabled.
-    if (!hasSharedFolder) {
-      this.progress("Processing owned Zoom meetings...");
-      const ownedReport = await this.processMeetingSource(
-        "owned",
-        filter,
-        autoDelete,
-        this.writer,
-        this.lastProcessedOwned
-      );
-      allResults.push(...ownedReport.results);
-      totalWritten += ownedReport.written;
-      totalSkipped += ownedReport.skipped;
-      totalErrors += ownedReport.errors;
-      totalDeleted += ownedReport.deleted;
-      totalDeleteFailed += ownedReport.deleteFailed;
-    }
+    // Always process owned meetings (full scan every time — owned meetings
+    // are deletable, so incremental timestamps aren't needed).
+    this.progress("Processing owned Zoom meetings...");
+    const ownedReport = await this.processMeetingSource(
+      "owned",
+      filter,
+      autoDelete,
+      this.writer
+    );
+    allResults.push(...ownedReport.results);
+    totalWritten += ownedReport.written;
+    totalSkipped += ownedReport.skipped;
+    totalErrors += ownedReport.errors;
+    totalDeleted += ownedReport.deleted;
+    totalDeleteFailed += ownedReport.deleteFailed;
 
-    // Process shared meetings when folder is configured.
+    // Also process shared meetings when folder is configured.
+    let latestSharedMeetingDate: string | undefined;
     if (hasSharedFolder) {
       this.progress("Processing shared Zoom meetings...");
       try {
@@ -164,6 +161,11 @@ export class SyncOrchestrator {
         totalWritten += sharedReport.written;
         totalSkipped += sharedReport.skipped;
         totalErrors += sharedReport.errors;
+
+        // Track latest shared meeting date for scan-date advancement
+        if (sharedReport.latestMeetingDate) {
+          latestSharedMeetingDate = sharedReport.latestMeetingDate;
+        }
         // Note: skip delete stats for shared (they're never deleted)
       } catch (e) {
         this.progress(
@@ -183,23 +185,20 @@ export class SyncOrchestrator {
     };
 
     // Update scan timestamps.
-    // Owned: only advance when autoDelete is enabled (meetings are removed from
-    // Zoom, so they won't appear on the next list). Without delete, the same
-    // meetings persist and the timestamp must stay so they're re-scanned.
-    // Shared: only advance when NO topic filter is active, because a filter
-    // would skip non-matching meetings that haven't been processed yet.
-    // Shared meetings are never deleted, but each is written idempotently.
-    if (!hasSharedFolder && autoDelete) {
-      report.updatedLastProcessedOwned = runTimestamp;
-      this.dbg(`[scan-dates] Will advance lastProcessedOwned → ${runTimestamp}`);
-    } else if (!hasSharedFolder) {
-      this.dbg(`[scan-dates] NOT advancing lastProcessedOwned (autoDelete is off)`);
-    }
-    if (hasSharedFolder && !filter) {
-      report.updatedLastProcessedShared = runTimestamp;
-      this.dbg(`[scan-dates] Will advance lastProcessedShared → ${runTimestamp}`);
+    // Owned: no timestamp tracking — owned meetings can be deleted from Zoom
+    // after writing, so a full scan each time is appropriate.
+    // Shared: advance only when autoDelete is on AND no topic filter is active.
+    // Uses the latest meeting date seen (not the run timestamp) so that
+    // meetings dated after the last-processed date are always picked up.
+    if (hasSharedFolder && autoDelete && !filter && latestSharedMeetingDate) {
+      report.updatedLastProcessedShared = latestSharedMeetingDate;
+      this.dbg(`[scan-dates] Will advance lastProcessedShared → ${latestSharedMeetingDate} (latest meeting date)`);
     } else if (hasSharedFolder) {
-      this.dbg(`[scan-dates] NOT advancing lastProcessedShared (topic filter is active)`);
+      const reasons: string[] = [];
+      if (!autoDelete) reasons.push("autoDelete is off");
+      if (filter) reasons.push("topic filter is active");
+      if (!latestSharedMeetingDate) reasons.push("no shared meetings found");
+      this.dbg(`[scan-dates] NOT advancing lastProcessedShared (${reasons.join(", ")})`);
     }
 
     const summary =
@@ -509,10 +508,15 @@ export class SyncOrchestrator {
     let written = 0;
     let skipped = plan.length - active.length;
     let errors = 0;
+    let latestMeetingDate: string | undefined;
     const results: SyncResult[] = [];
     const toDelete: Array<{ topic: string; rawId: string }> = [];
 
     for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action } of active) {
+      // Track latest meeting date for scan-date bookkeeping
+      if (parsedDate && (!latestMeetingDate || parsedDate > latestMeetingDate)) {
+        latestMeetingDate = parsedDate;
+      }
       if (!vaultFile || !rawId) {
         results.push({ topic, status: "SKIP (no file)" });
         skipped++;
@@ -590,6 +594,7 @@ export class SyncOrchestrator {
       errors,
       deleted,
       deleteFailed,
+      latestMeetingDate,
     };
 
     return report;

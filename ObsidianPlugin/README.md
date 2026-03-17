@@ -81,7 +81,7 @@ After enabling the plugin, go to **Settings → Zoom Meeting Summaries**:
 |---------|-------------|
 | **Vault subfolder** | Subfolder within vault root where 1:1 folders live (e.g. `MyOrg`). Leave blank to search from root. |
 | **1:1 note folders** | Comma-separated folder names containing 1:1 note files. Default: `! One on Ones, ! One on Ones (Other)` |
-| **Folder for Shared Meetings** | (Optional) Folder where meetings shared with you are written. Shared meetings are listed from `#/summaryShare` and are never deleted from Zoom. When this is set, sync runs in shared-only mode (owned-host meetings are not processed). |
+| **Folder for Shared Meetings** | (Optional) Folder where meetings shared with you are written. Shared meetings are listed from `#/summaryShare` and are never deleted from Zoom. When set, shared meetings are processed in addition to owned meetings. |
 
 ### Sync Behavior
 
