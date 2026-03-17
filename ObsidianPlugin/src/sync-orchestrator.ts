@@ -242,10 +242,12 @@ export class SyncOrchestrator {
     };
 
     const sanitizeFileStem = (value: string): string => {
-      const stem = value
+      let stem = value
         .replace(/[<>:"/\\|?*]/g, "-")
         .replace(/\s+/g, " ")
         .trim();
+      // Leading dots make files hidden in Obsidian; replace with "dot"
+      stem = stem.replace(/^\.+/, (m) => "dot".repeat(m.length));
       return stem || "Untitled Meeting";
     };
 
@@ -470,8 +472,16 @@ export class SyncOrchestrator {
       return writer.hasSummaryContent(s);
     };
 
-    for (const { rawId, topic, instanceKey, dateHint } of active) {
+    for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate } of active) {
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
+        // Skip fetch if the vault file already has a summary for this date
+        if (vaultFile && parsedDate) {
+          const alreadyWritten = await writer.hasExistingSummary(vaultFile, parsedDate);
+          if (alreadyWritten) {
+            this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
+            continue;
+          }
+        }
         toFetchFull.set(instanceKey, { rawId, topic, dateHint });
         this.dbg(`[fetch-plan] Will fetch: instanceKey=${instanceKey} rawId=${rawId} dateHint="${dateHint}" topic="${topic}"`);
       }

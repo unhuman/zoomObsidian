@@ -291,10 +291,16 @@ export class VaultWriter {
   }> {
     const normalizedPath = normalizePath(filePath);
     let content: string;
+    // Track whether we have a TFile reference (for vault.modify) or need adapter.write
+    let existingFile: TFile | null = null;
 
-    const existingFile = this.app.vault.getAbstractFileByPath(normalizedPath);
-    if (existingFile instanceof TFile) {
+    const abstractFile = this.app.vault.getAbstractFileByPath(normalizedPath);
+    if (abstractFile instanceof TFile) {
+      existingFile = abstractFile;
       content = await this.app.vault.read(existingFile);
+    } else if (await this.app.vault.adapter.exists(normalizedPath)) {
+      // File exists on disk but isn't in Obsidian's index (e.g. dot-files like .Net)
+      content = await this.app.vault.adapter.read(normalizedPath);
     } else {
       // File doesn't exist — create with standalone section
       const newSection = this.formatSummarySection(dateStr, summary, false);
@@ -302,6 +308,15 @@ export class VaultWriter {
       await this.app.vault.create(normalizedPath, newSection);
       return { inserted: true, position: "top", filePath: normalizedPath };
     }
+
+    // Helper to write content — uses vault.modify when we have a TFile, adapter.write otherwise
+    const writeContent = async (data: string) => {
+      if (existingFile) {
+        await this.app.vault.modify(existingFile, data);
+      } else {
+        await this.app.vault.adapter.write(normalizedPath, data);
+      }
+    };
 
     // Idempotency: already written with content — skip
     const headerRegex = new RegExp(
@@ -323,7 +338,7 @@ export class VaultWriter {
         .trimStart();
       if (!content.trim()) {
         const newSection = this.formatSummarySection(dateStr, summary, false);
-        await this.app.vault.modify(existingFile, newSection);
+        await writeContent(newSection);
         return { inserted: true, position: "top", filePath: normalizedPath };
       }
     }
@@ -361,7 +376,7 @@ export class VaultWriter {
       const before = lines.slice(0, trimEnd).join("\n");
       const after = lines.slice(blockEnd).join("\n");
       const newContent = before + "\n\n" + body + (after ? "\n" + after : "");
-      await this.app.vault.modify(existingFile, newContent);
+      await writeContent(newContent);
       return { inserted: true, position: "middle", filePath: normalizedPath };
     }
 
@@ -396,7 +411,7 @@ export class VaultWriter {
       position = "middle";
     }
 
-    await this.app.vault.modify(existingFile, newContent);
+    await writeContent(newContent);
     return { inserted: true, position, filePath: normalizedPath };
   }
 
@@ -449,5 +464,30 @@ export class VaultWriter {
       }
     }
     return false;
+  }
+
+  /**
+   * Check if a vault file already contains a non-empty Zoom AI Summary for the given date.
+   * Used to skip expensive network fetches for meetings already written.
+   */
+  async hasExistingSummary(filePath: string, dateStr: string): Promise<boolean> {
+    const normalizedPath = normalizePath(filePath);
+    let content: string;
+
+    const abstractFile = this.app.vault.getAbstractFileByPath(normalizedPath);
+    if (abstractFile instanceof TFile) {
+      content = await this.app.vault.read(abstractFile);
+    } else if (await this.app.vault.adapter.exists(normalizedPath)) {
+      content = await this.app.vault.adapter.read(normalizedPath);
+    } else {
+      return false;
+    }
+
+    const headerRegex = new RegExp(
+      `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`,
+      "m"
+    );
+    const hasHeader = headerRegex.test(content) || this.dateBlockContains(content, dateStr, "Zoom AI Summary");
+    return hasHeader && !this.zoomBlockIsEmpty(content, dateStr);
   }
 }
