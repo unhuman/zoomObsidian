@@ -8,8 +8,8 @@
  * Desktop-only (requires Electron APIs for auth).
  */
 
-import { Modal, Notice, Plugin, type App } from "obsidian";
-import { DEFAULT_SETTINGS, type ZoomObsidianSettings } from "./types";
+import { Modal, Notice, Plugin, type App, TFolder } from "obsidian";
+import { DEFAULT_SETTINGS, DEFAULT_CONFIG_STATE, type ZoomObsidianSettings, type ObsidianConfigState } from "./types";
 import { ZoomAuth } from "./zoom-auth";
 import { ZoomClient } from "./zoom-client";
 import { VaultWriter } from "./vault-writer";
@@ -18,12 +18,14 @@ import { ZoomObsidianSettingTab } from "./settings";
 
 export default class ZoomObsidianPlugin extends Plugin {
   settings!: ZoomObsidianSettings;
+  configState!: ObsidianConfigState;
   auth!: ZoomAuth;
   private client!: ZoomClient;
   private writer!: VaultWriter;
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    await this.loadConfigState();
 
     this.auth = new ZoomAuth({
       subdomain: this.settings.zoomSubdomain,
@@ -107,6 +109,37 @@ export default class ZoomObsidianPlugin extends Plugin {
     }
   }
 
+  async loadConfigState(): Promise<void> {
+    try {
+      const rawData = await this.app.vault.adapter.read(
+        `${this.manifest.dir}/obsidian-config.json`
+      );
+      this.configState = Object.assign(
+        {},
+        DEFAULT_CONFIG_STATE,
+        JSON.parse(rawData)
+      );
+    } catch {
+      // File doesn't exist or is invalid; use defaults
+      this.configState = Object.assign({}, DEFAULT_CONFIG_STATE);
+    }
+  }
+
+  async saveConfigState(): Promise<void> {
+    try {
+      const configPath = `${this.manifest.dir}/obsidian-config.json`;
+      await this.app.vault.adapter.write(
+        configPath,
+        JSON.stringify(this.configState, null, 2)
+      );
+    } catch (e) {
+      console.error(
+        "[zoom-obsidian] Failed to save config state:",
+        (e as Error).message
+      );
+    }
+  }
+
   private parseOneFolders(): string[] {
     return this.settings.oneOnOneFolders
       .split(",")
@@ -134,6 +167,18 @@ export default class ZoomObsidianPlugin extends Plugin {
       return;
     }
 
+    // Validate shared meetings folder exists if specified
+    if (this.settings.sharedMeetingsFolder?.trim()) {
+      const folderPath = this.settings.sharedMeetingsFolder.trim();
+      const folder = this.app.vault.getAbstractFileByPath(folderPath);
+      if (!folder || !(folder instanceof TFolder)) {
+        new Notice(
+          `Error: Shared Meetings folder does not exist: "${folderPath}". Please create it or update the setting.`
+        );
+        return;
+      }
+    }
+
     // Rebuild writer in case settings changed
     this.writer = new VaultWriter(this.app, {
       vaultSubfolder: this.settings.vaultSubfolder,
@@ -142,6 +187,7 @@ export default class ZoomObsidianPlugin extends Plugin {
 
     const orchestrator = new SyncOrchestrator(this.client, this.writer, {
       debug: this.settings.debug,
+      sharedMeetingsFolder: this.settings.sharedMeetingsFolder || undefined,
     });
 
     // Show progress via Notice

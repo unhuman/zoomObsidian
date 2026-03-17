@@ -21,6 +21,10 @@ export interface SyncPlanEntry {
   topic: string;
   rawId: string;
   parsedDate: string;
+  /** Raw date text from the table row, used to disambiguate recurring instances. */
+  dateHint: string;
+  /** Composite key for recurring instances: rawId__parsedDate */
+  instanceKey: string;
   vaultFile: string | null;
   action: "insert" | "create" | "skip";
 }
@@ -44,6 +48,7 @@ export class SyncOrchestrator {
   private client: ZoomClient;
   private writer: VaultWriter;
   private debug: boolean;
+  private sharedMeetingsFolder?: string;
 
   // In-memory caches (same pattern as the standalone script)
   private attendeesCache: Record<string, string[]> = {};
@@ -55,11 +60,12 @@ export class SyncOrchestrator {
   constructor(
     client: ZoomClient,
     writer: VaultWriter,
-    opts?: { debug?: boolean }
+    opts?: { debug?: boolean; sharedMeetingsFolder?: string }
   ) {
     this.client = client;
     this.writer = writer;
     this.debug = opts?.debug ?? false;
+    this.sharedMeetingsFolder = opts?.sharedMeetingsFolder;
   }
 
   private dbg(...args: unknown[]): void {
@@ -73,6 +79,7 @@ export class SyncOrchestrator {
 
   /**
    * Run the full sync workflow. Returns a report of all actions taken.
+   * Processes both owned and shared meetings (if configured).
    *
    * @param opts.filter   — Optional topic substring filter.
    * @param opts.autoDelete — If true, delete summaries from Zoom after writing.
@@ -88,9 +95,121 @@ export class SyncOrchestrator {
     this.attendeesCache = {};
     this.summaryCache = {};
 
+    const allResults: SyncResult[] = [];
+    let totalWritten = 0,
+      totalSkipped = 0,
+      totalErrors = 0,
+      totalDeleted = 0,
+      totalDeleteFailed = 0;
+
+    const hasSharedFolder = !!this.sharedMeetingsFolder?.trim();
+
+    // Process owned meetings only when shared-only mode is not enabled.
+    if (!hasSharedFolder) {
+      this.progress("Processing owned Zoom meetings...");
+      const ownedReport = await this.processMeetingSource(
+        "owned",
+        filter,
+        autoDelete,
+        this.writer
+      );
+      allResults.push(...ownedReport.results);
+      totalWritten += ownedReport.written;
+      totalSkipped += ownedReport.skipped;
+      totalErrors += ownedReport.errors;
+      totalDeleted += ownedReport.deleted;
+      totalDeleteFailed += ownedReport.deleteFailed;
+    }
+
+    // Process shared meetings when folder is configured.
+    if (hasSharedFolder) {
+      this.progress("Processing shared Zoom meetings...");
+      try {
+        // Create a VaultWriter context for shared meetings folder
+        const sharedMeetingsWriter = new (this.writer.constructor as any)(
+          (this.writer as any).app,
+          {
+            vaultSubfolder: "", // shared meetings are in the dedicated folder, not in vault subfolder
+            oneOnOneFolders: [this.sharedMeetingsFolder.trim()],
+          }
+        );
+        const sharedReport = await this.processMeetingSource(
+          "shared",
+          filter,
+          false, // never auto-delete shared meetings (Zoom API limitation)
+          sharedMeetingsWriter
+        );
+        allResults.push(...sharedReport.results);
+        totalWritten += sharedReport.written;
+        totalSkipped += sharedReport.skipped;
+        totalErrors += sharedReport.errors;
+        // Note: skip delete stats for shared (they're never deleted)
+      } catch (e) {
+        this.progress(
+          `Skipping shared meetings: ${(e as Error).message}`
+        );
+      }
+    }
+
+    // Combine and report
+    const report: SyncReport = {
+      results: allResults,
+      written: totalWritten,
+      skipped: totalSkipped,
+      errors: totalErrors,
+      deleted: totalDeleted,
+      deleteFailed: totalDeleteFailed,
+    };
+
+    const summary =
+      `Sync complete: ${totalWritten} written, ${totalSkipped} skipped, ${totalErrors} errors` +
+      (autoDelete
+        ? `, ${totalDeleted} deleted, ${totalDeleteFailed} delete failures`
+        : "");
+    this.progress(summary);
+    new Notice(summary);
+
+    return report;
+  }
+
+  /**
+   * Process meetings from a single source (owned or shared).
+   * Executes the 7-phase workflow for the given source.
+   */
+  private async processMeetingSource(
+    sourceType: "owned" | "shared",
+    filter: string,
+    autoDelete: boolean,
+    writer: VaultWriter
+  ): Promise<SyncReport> {
+    const extractMeetingId = (m: MeetingSummaryItem): string => {
+      const candidates = [
+        m.meeting_id,
+        (m as Record<string, unknown>).column_2,
+        (m as Record<string, unknown>).column_3,
+        (m as Record<string, unknown>).column_4,
+        (m as Record<string, unknown>).column_1,
+      ];
+      for (const c of candidates) {
+        const raw = (c ?? "").toString().trim();
+        if (!raw) continue;
+        const digits = raw.replace(/\D/g, "");
+        if (digits.length >= 9 && digits.length <= 14) return digits;
+      }
+      return "";
+    };
+
+    const sanitizeFileStem = (value: string): string => {
+      const stem = value
+        .replace(/[<>:"/\\|?*]/g, "-")
+        .replace(/\s+/g, " ")
+        .trim();
+      return stem || "Untitled Meeting";
+    };
+
     // Phase 1: list meetings
-    this.progress("Listing Zoom meeting summaries...");
-    const allMeetings = await this.client.listSummaries();
+    this.progress(`Listing ${sourceType} meeting summaries...`);
+    const allMeetings = await this.client.listSummaries(sourceType as any);
     const meetings = filter
       ? allMeetings.filter((m) =>
           (m.meeting_topic ?? (m as Record<string, unknown>).column_1 ?? "")
@@ -100,10 +219,10 @@ export class SyncOrchestrator {
         )
       : allMeetings;
     this.progress(
-      `Found ${allMeetings.length} meetings${filter ? `, ${meetings.length} match filter "${filter}"` : ""}.`
+      `  Found ${allMeetings.length} ${sourceType} meetings${filter ? `, ${meetings.length} match filter "${filter}"` : ""}.`
     );
 
-    const allFiles = await this.writer.allFiles();
+    const allFiles = await writer.allFiles();
 
     // Helper: check if first name matches multiple files (ambiguous)
     const isAmbiguousMatch = (firstName: string | null): boolean => {
@@ -130,11 +249,11 @@ export class SyncOrchestrator {
       )
         .toString()
         .replace(/^Select /, "");
-      const rawId = (
-        (m as Record<string, unknown>).column_2 ?? ""
-      )
-        .toString()
-        .replace(/[\s-]/g, "");
+      const rawId = extractMeetingId(m);
+
+      if (sourceType === "shared") {
+        continue;
+      }
 
       const topicFirst = topic.split(":")[0].trim();
       const isCandidate =
@@ -161,7 +280,7 @@ export class SyncOrchestrator {
     for (const [rawId, topic] of toFetchAttendees) {
       this.progress(`  Fetching attendees: ${topic} (${rawId})...`);
       try {
-        const data = await this.client.getSummary(rawId);
+        const data = await this.client.getSummary(rawId, sourceType);
         const names: string[] = [];
         for (const item of (data?.nextStepItems ?? data?.next_step_items ?? []) as Array<{
           assignees?: Array<{ username?: string }>;
@@ -191,14 +310,38 @@ export class SyncOrchestrator {
       )
         .toString()
         .replace(/^Select /, "");
-      const rawId = (
-        (m as Record<string, unknown>).column_2 ?? ""
-      )
-        .toString()
-        .replace(/[\s-]/g, "");
-      const date = ((m as Record<string, unknown>).column_4 ?? "").toString().trim();
+      const rawId = extractMeetingId(m);
+      // Shared table: topic(0)/ID(1)/owner(2)/date(3). Owned: topic(0)/date(1)/ID(2).
+      const dateCol = sourceType === 'shared' ? 'column_3' : 'column_4';
+      const date = ((m as Record<string, unknown>)[dateCol] ?? (m as Record<string, unknown>).column_4 ?? (m as Record<string, unknown>).column_3 ?? "").toString().trim();
       const attendees = attendeesMap.get(rawId) ?? [];
-      const parsedDate = this.writer.parseMeetingDate(date);
+      const parsedDate = writer.parseMeetingDate(date);
+      const instanceKey = `${rawId}__${parsedDate}`;
+
+      this.dbg(`[plan] topic="${topic}" rawId=${rawId} dateCol=${dateCol} rawDate="${date}" parsedDate=${parsedDate} instanceKey=${instanceKey} cols={c0=${(m as any).column_0?.toString().substring(0,30)}, c1=${(m as any).column_1?.toString().substring(0,30)}, c2=${(m as any).column_2?.toString().substring(0,30)}, c3=${(m as any).column_3?.toString().substring(0,30)}, c4=${(m as any).column_4}}`);
+
+      if (!rawId) {
+        plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: null, action: "skip" });
+        continue;
+      }
+
+      if (sourceType === "shared") {
+        const sharedFolder = this.sharedMeetingsFolder?.trim() ?? "";
+        const targetPath = `${sharedFolder}/${sanitizeFileStem(topic)}.md`;
+        const existing = allFiles.find(
+          (f) => f.path.toLowerCase() === targetPath.toLowerCase()
+        );
+        plan.push({
+          topic,
+          rawId,
+          parsedDate,
+          dateHint: date,
+          instanceKey,
+          vaultFile: existing?.path ?? targetPath,
+          action: existing ? "insert" : "create",
+        });
+        continue;
+      }
 
       // Skip multi-person meetings
       const otherAttendees = attendees.filter(
@@ -218,21 +361,23 @@ export class SyncOrchestrator {
           topic,
           rawId,
           parsedDate,
+          dateHint: date,
+          instanceKey,
           vaultFile: null,
           action: "skip",
         });
         continue;
       }
 
-      const vaultFile = await this.writer.findPersonFile(
+      const vaultFile = await writer.findPersonFile(
         topic,
         attendees.length ? attendees : undefined
       );
 
       if (vaultFile) {
-        plan.push({ topic, rawId, parsedDate, vaultFile, action: "insert" });
+        plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile, action: "insert" });
       } else {
-        const suggested = this.writer.suggestNewFilePath(
+        const suggested = writer.suggestNewFilePath(
           topic,
           attendees.length ? attendees : undefined
         );
@@ -241,6 +386,8 @@ export class SyncOrchestrator {
             topic,
             rawId,
             parsedDate,
+            dateHint: date,
+            instanceKey,
             vaultFile: null,
             action: "skip",
           });
@@ -249,6 +396,8 @@ export class SyncOrchestrator {
             topic,
             rawId,
             parsedDate,
+            dateHint: date,
+            instanceKey,
             vaultFile: suggested,
             action: "create",
           });
@@ -265,31 +414,34 @@ export class SyncOrchestrator {
 
     // Phase 4: pre-fetch summaries
     this.progress("Fetching summaries...");
-    const toFetchFull = new Map<string, string>();
+    // Use instanceKey (rawId__date) to distinguish recurring meeting instances
+    const toFetchFull = new Map<string, { rawId: string; topic: string; dateHint: string }>();
 
-    const hasCachedContent = (rawId: string): boolean => {
-      const s = this.summaryCache[rawId] as ZoomSummaryData | undefined;
+    const hasCachedContent = (key: string): boolean => {
+      const s = this.summaryCache[key] as ZoomSummaryData | undefined;
       if (!s) return false;
-      return this.writer.hasSummaryContent(s);
+      return writer.hasSummaryContent(s);
     };
 
-    for (const { rawId, topic } of active) {
-      if (rawId && !hasCachedContent(rawId) && !toFetchFull.has(rawId)) {
-        toFetchFull.set(rawId, topic);
+    for (const { rawId, topic, instanceKey, dateHint } of active) {
+      if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
+        toFetchFull.set(instanceKey, { rawId, topic, dateHint });
+        this.dbg(`[fetch-plan] Will fetch: instanceKey=${instanceKey} rawId=${rawId} dateHint="${dateHint}" topic="${topic}"`);
       }
     }
 
-    if (toFetchFull.size > 0) {
+    if (toFetchFull.size > 0 && sourceType !== "shared") {
       this.progress(
         `Pre-fetching nav IDs for ${toFetchFull.size} meetings...`
       );
-      await this.client.prefetchNavIds([...toFetchFull.keys()]);
+      const uniqueIds = [...new Set([...toFetchFull.values()].map(v => v.rawId))];
+      await this.client.prefetchNavIds(uniqueIds, sourceType);
     }
 
-    for (const [rawId, topic] of toFetchFull) {
-      this.progress(`  Fetching: ${topic} (${rawId})...`);
+    for (const [instanceKey, { rawId, topic, dateHint }] of toFetchFull) {
+      this.progress(`  Fetching: ${topic} (${rawId}) date=${dateHint}...`);
       try {
-        this.summaryCache[rawId] = await this.client.getSummary(rawId);
+        this.summaryCache[instanceKey] = await this.client.getSummary(rawId, sourceType, topic, dateHint);
       } catch (e) {
         this.progress(`  Error: ${(e as Error).message}`);
       }
@@ -298,25 +450,31 @@ export class SyncOrchestrator {
     // Phase 5: write summaries
     this.progress("Writing summaries...");
     let written = 0;
-    let skipped = 0;
+    let skipped = plan.length - active.length;
     let errors = 0;
     const results: SyncResult[] = [];
     const toDelete: Array<{ topic: string; rawId: string }> = [];
 
-    for (const { topic, rawId, parsedDate, vaultFile, action } of active) {
+    for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action } of active) {
       if (!vaultFile || !rawId) {
         results.push({ topic, status: "SKIP (no file)" });
         skipped++;
         continue;
       }
-      const summary = this.summaryCache[rawId] as ZoomSummaryData | undefined;
+      const summary = this.summaryCache[instanceKey] as ZoomSummaryData | undefined;
       if (!summary) {
         results.push({ topic, status: "SKIP (no summary)" });
         skipped++;
         continue;
       }
+      if (!writer.hasSummaryContent(summary)) {
+        const errorDetail = (summary as Record<string, unknown>).error
+          ? ` error=${String((summary as Record<string, unknown>).error)}`
+          : "";
+        this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — writing placeholder`);
+      }
       try {
-        const r = await this.writer.insertSummary(vaultFile, parsedDate, summary);
+        const r = await writer.insertSummary(vaultFile, parsedDate, summary);
         if (r.inserted) {
           written++;
           toDelete.push({ topic, rawId });
@@ -376,11 +534,6 @@ export class SyncOrchestrator {
       deleted,
       deleteFailed,
     };
-
-    const summary = `Sync complete: ${written} written, ${skipped} skipped, ${errors} errors` +
-      (autoDelete ? `, ${deleted} deleted, ${deleteFailed} delete failures` : "");
-    this.progress(summary);
-    new Notice(summary);
 
     return report;
   }

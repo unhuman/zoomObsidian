@@ -50,6 +50,14 @@ export class ZoomClient {
     return Object.fromEntries(this.navIdCache);
   }
 
+  private navCacheKey(numericId: string, sourceType: 'owned' | 'shared' = 'owned', dateHint?: string): string {
+    return dateHint ? `${sourceType}:${numericId}:${dateHint}` : `${sourceType}:${numericId}`;
+  }
+
+  private normalizeTopic(s: string): string {
+    return s.toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
   // ─── Hidden BrowserWindow for SPA scraping ────────────────────
 
   /**
@@ -110,6 +118,58 @@ export class ZoomClient {
   private async navigateScrapeWindow(url: string): Promise<void> {
     const win = await this.getOrCreateScrapeWindow();
     await win.loadURL(url);
+  }
+
+  /**
+   * Reset the SPA list pagination to page 1. After listSummaries pages through
+   * all pages, the SPA stays on the last page. Subsequent resolveNavId calls
+   * must start from page 1 to find meetings sorted newest-first.
+   */
+  private async resetToFirstPage(): Promise<void> {
+    const pageInfo = await this.execInWindow<{ active: string | null; hasFirst: boolean }>(`
+      (function() {
+        var active = document.querySelector('.zm-pager li.number.active');
+        var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
+        var first = document.querySelector('.zm-pager li.number[data-page="1"]');
+        return { active: p, hasFirst: !!first };
+      })()
+    `);
+    if (pageInfo.active && pageInfo.active !== '1') {
+      this.dbg(`[resetToFirstPage] Currently on page ${pageInfo.active}, resetting to 1...`);
+      if (pageInfo.hasFirst) {
+        await this.execInWindow<void>(`document.querySelector('.zm-pager li.number[data-page="1"]').click()`);
+      } else {
+        // Click btn-prev repeatedly until we're on page 1
+        let safety = 20;
+        while (safety-- > 0) {
+          const cur = await this.execInWindow<string>(`
+            (function() {
+              var a = document.querySelector('.zm-pager li.number.active');
+              return a ? (a.getAttribute('data-page') || a.textContent.trim()) : '1';
+            })()
+          `);
+          if (cur === '1') break;
+          const hasPrev = await this.execInWindow<boolean>(`
+            (function() {
+              var btn = document.querySelector('button.btn-prev');
+              return !!btn && !btn.disabled;
+            })()
+          `);
+          if (!hasPrev) break;
+          await this.execInWindow<void>(`document.querySelector('button.btn-prev').click()`);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+      // Wait for rows to re-render after page change
+      await this.waitForCondition(`
+        (function() {
+          var a = document.querySelector('.zm-pager li.number.active');
+          return !a || (a.getAttribute('data-page') || a.textContent.trim()) === '1';
+        })()
+      `, 10000);
+      await new Promise((r) => setTimeout(r, 300));
+      this.dbg(`[resetToFirstPage] Now on page 1.`);
+    }
   }
 
   /**
@@ -210,35 +270,57 @@ export class ZoomClient {
    * List all meeting summaries by loading the SPA in a hidden BrowserWindow,
    * waiting for the table to render, and extracting rows via executeJavaScript.
    * Paginates by clicking the Next button.
+   *
+   * @param sourceType - 'owned' for user's own meetings (#/list), 'shared' for meetings shared with user (#/summaryShare)
    */
   async listSummaries(
+    sourceType: 'owned' | 'shared' = 'owned',
     options: { from?: string; to?: string } = {}
   ): Promise<MeetingSummaryItem[]> {
     const baseUrl = this.auth.baseUrl;
-    let url = `${baseUrl}/user/meeting/summary#/`;
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    let url = `${baseUrl}/user/meeting/summary#/${hashFragment}`;
     if (options.from || options.to) {
       const u = new URL(`${baseUrl}/user/meeting/summary`);
       if (options.from) u.searchParams.set("from", options.from);
       if (options.to) u.searchParams.set("to", options.to);
-      url = u.toString();
+      url = `${u.toString()}#/${hashFragment}`;
     }
 
     this.dbg("Navigating scrape window to:", url);
     await this.navigateScrapeWindow(url);
 
+    // Defensive: some loads land on the default list route even when a hash was supplied.
+    // Force the intended route and give the SPA time to react.
+    const expectedHash = sourceType === "shared" ? "#/summaryShare" : "#/list";
+    const currentHash = await this.execInWindow<string>("window.location.hash || ''");
+    if (!currentHash.startsWith(expectedHash)) {
+      this.dbg(`Route mismatch after load (have "${currentHash}", want "${expectedHash}"). Forcing hash.`);
+      await this.execInWindow<void>(`window.location.hash = ${JSON.stringify(expectedHash)}`);
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
     // Wait for the SPA table to render
     const tableReady = await this.waitForCondition(`
       !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-         document.querySelector('.zm-table__body tbody tr'))
+         document.querySelector('.zm-table__body tbody tr') ||
+         document.querySelector('.zm-table__empty, .zm-empty-state, .empty-state'))
     `, 15000);
 
     if (!tableReady) {
       this.dbg("Table never appeared — checking page content");
       const pageInfo = await this.execInWindow<string>(`
-        (document.querySelector('main, #content, .content, [role=main]') || document.body)
-          .textContent.trim().substring(0, 2000)
+        (function() {
+          var main = document.querySelector('main, #content, .content, [role=main]') || document.body;
+          var hash = window.location.hash || '';
+          var href = window.location.href || '';
+          var tables = document.querySelectorAll('table').length;
+          var rows = document.querySelectorAll('tbody tr').length;
+          var text = (main.textContent || '').trim().substring(0, 2000);
+          return JSON.stringify({ hash: hash, href: href, tables: tables, rows: rows, text: text });
+        })()
       `);
-      this.dbg("Page text:", pageInfo);
+      this.dbg("Page diagnostics:", pageInfo);
       return [];
     }
 
@@ -256,13 +338,25 @@ export class ZoomClient {
         var rows = bodyTable.querySelectorAll('tbody tr');
         rows.forEach(function(row) {
           var cells = row.querySelectorAll('td');
-          var topicBtn = row.querySelector('button.topic-link');
+          var topicBtn = row.querySelector('button.topic-link, a.topic-link, td:first-child button, td:first-child a');
           var item = {};
           if (topicBtn) item.meeting_topic = topicBtn.textContent.trim();
           cells.forEach(function(cell, i) {
             var text = cell.textContent.trim();
             if (text) item['column_' + i] = text;
           });
+          if (!item.meeting_topic && cells.length > 0) {
+            item.meeting_topic = (cells[0].textContent || '').trim();
+          }
+          if (!item.meeting_id) {
+            for (var j = 0; j < cells.length; j++) {
+              var digits = ((cells[j].textContent || '')).replace(/\D/g, '');
+              if (digits.length >= 9 && digits.length <= 14) {
+                item.meeting_id = digits;
+                break;
+              }
+            }
+          }
           if (Object.keys(item).length > 0) results.push(item);
         });
         return results;
@@ -325,12 +419,22 @@ export class ZoomClient {
    *
    * Returns null if the meeting is not found.
    */
-  async resolveNavId(numericId: string): Promise<NavIdEntry | null> {
-    const cached = this.navIdCache.get(numericId);
-    if (cached) return cached;
+  async resolveNavId(
+    numericId: string,
+    sourceType: 'owned' | 'shared' = 'owned',
+    dateHint?: string
+  ): Promise<NavIdEntry | null> {
+    const cacheKey = this.navCacheKey(numericId, sourceType, dateHint);
+    const cached = this.navIdCache.get(cacheKey);
+    if (cached) {
+      this.dbg(`[resolveNavId] Cache HIT for ${numericId} dateHint="${dateHint}" cacheKey=${cacheKey}`);
+      return cached;
+    }
+    this.dbg(`[resolveNavId] Cache MISS for ${numericId} dateHint="${dateHint}" cacheKey=${cacheKey}. Navigating to list...`);
 
     const baseUrl = this.auth.baseUrl;
-    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary`);
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
 
     // Wait for SPA table
     const tableReady = await this.waitForCondition(`
@@ -339,45 +443,105 @@ export class ZoomClient {
     `, 15000);
     if (!tableReady) return null;
 
+    // Reset to page 1 — the SPA may still be on a later page from a prior scan
+    await this.resetToFirstPage();
+
     while (true) {
-      // Try to find and click the row
-      const found = await this.execInWindow<boolean>(`
+      // Try to find and click the row (with optional dateHint to pick the right recurring instance)
+      const clickResult = await this.execInWindow<{ found: boolean; candidateCount: number; matchedDate: boolean; clickedRowText: string }>(`
         (function() {
           var id = ${JSON.stringify(numericId)};
+          var dateHint = ${JSON.stringify(dateHint ?? '')};
           var rows = document.querySelectorAll(
             '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr'
           );
+          var candidates = [];
           for (var i = 0; i < rows.length; i++) {
-            var idCell = rows[i].querySelector('td:nth-child(3)');
-            var cellText = (idCell ? idCell.textContent : '').replace(/[\\s-]/g, '');
-            if (cellText === id) {
-              var btn = rows[i].querySelector('button.topic-link');
-              if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-              return true;
+            var cells = rows[i].querySelectorAll('td');
+            var idMatch = false;
+            for (var j = 0; j < cells.length; j++) {
+              if ((cells[j].textContent || '').replace(/[\\s-]/g, '') === id) { idMatch = true; break; }
             }
+            if (idMatch) candidates.push(rows[i]);
           }
-          return false;
+          if (candidates.length === 0) return { found: false, candidateCount: 0, matchedDate: false, clickedRowText: '' };
+
+          var target = null;
+          var matchedDate = false;
+          if (dateHint) {
+            // When dateHint is provided, ONLY click if we find a row containing that date.
+            // This prevents clicking the wrong recurring instance on the wrong page.
+            for (var k = 0; k < candidates.length; k++) {
+              if ((candidates[k].textContent || '').indexOf(dateHint) !== -1) {
+                target = candidates[k]; matchedDate = true; break;
+              }
+            }
+            if (!target) {
+              // Candidates exist but none match the dateHint — don't click, paginate instead.
+              return { found: false, candidateCount: candidates.length, matchedDate: false, clickedRowText: 'DATE_MISMATCH: candidates on page but none match dateHint' };
+            }
+          } else {
+            // No dateHint — just take the first match (legacy behavior)
+            target = candidates[0];
+            matchedDate = candidates.length === 1;
+          }
+          var clickedText = (target.textContent || '').trim().substring(0, 120);
+          var btn = target.querySelector('button.topic-link');
+          if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          return { found: true, candidateCount: candidates.length, matchedDate: matchedDate, clickedRowText: clickedText };
         })()
       `);
+      const found = clickResult.found;
+      this.dbg(`[resolveNavId] id=${numericId} dateHint="${dateHint}" found=${found} candidates=${clickResult.candidateCount} matchedDate=${clickResult.matchedDate} clickedRow="${clickResult.clickedRowText}"`);
 
       if (found) {
-        // Wait for hash to change to #/detail
+        this.dbg(`[resolveNavId] Row found for ${numericId} (${sourceType}), waiting for #/detail...`);
+      } else if (this.debug) {
+        // Dump first few rows to diagnose column layout
+        const rowDump = await this.execInWindow<string[]>(`
+          (function() {
+            var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr');
+            var out = [];
+            for (var i = 0; i < Math.min(rows.length, 3); i++) {
+              var cells = rows[i].querySelectorAll('td');
+              var parts = [];
+              for (var j = 0; j < cells.length; j++) parts.push('td[' + j + ']=' + (cells[j].textContent || '').trim().substring(0, 80));
+              out.push(parts.join(' | '));
+            }
+            return out;
+          })()
+        `);
+        this.dbg(`[resolveNavId] Row NOT found for ${numericId} on this page. First rows: ${JSON.stringify(rowDump)}`);
+      }
+
+      if (found) {
+        // Both owned and shared navigate to #/detail (shared adds isShared=true)
         const hashChanged = await this.waitForCondition(
           `window.location.hash.startsWith('#/detail')`,
           10000
         );
+        const finalHash = await this.execInWindow<string>(`window.location.hash`);
+        const finalHref = await this.execInWindow<string>(`window.location.href`);
+        this.dbg(`[resolveNavId] After click: hashChanged=${hashChanged} hash="${finalHash}" href="${finalHref}"`);
+
         if (hashChanged) {
-          const hash = await this.execInWindow<string>(`window.location.hash`);
-          const entry = this.parseDetailHash(hash);
+          const entry = this.parseDetailHash(finalHash);
           if (entry) {
-            this.navIdCache.set(numericId, entry);
+            if (sourceType === 'shared') entry.isShared = true;
+            this.navIdCache.set(cacheKey, entry);
+            this.dbg(`[resolveNavId] Cached: meetingId=${entry.uuidMeetingId} summaryId=${entry.summaryId} isShared=${entry.isShared}`);
             return entry;
+          } else {
+            this.dbg(`[resolveNavId] parseDetailHash returned null for hash: ${finalHash}`);
           }
+        } else {
+          this.dbg(`[resolveNavId] Hash did not change to #/detail. Current: ${finalHash}`);
         }
         return null;
       }
 
       // Check for next page
+      this.dbg(`[resolveNavId] id=${numericId} not found on current page, checking pagination...`);
       const hasNext = await this.execInWindow<boolean>(`
         (function() {
           var btn = document.querySelector('button.btn-next');
@@ -412,19 +576,28 @@ export class ZoomClient {
    * clicks the row, captures UUID + summaryId from the hash, then navigates
    * back to continue scanning.
    */
-  async prefetchNavIds(numericIds: string[]): Promise<void> {
-    const needed = new Set(numericIds.filter((id) => !this.navIdCache.has(id)));
+  async prefetchNavIds(
+    numericIds: string[],
+    sourceType: 'owned' | 'shared' = 'owned'
+  ): Promise<void> {
+    const needed = new Set(
+      numericIds.filter((id) => !this.navIdCache.has(this.navCacheKey(id, sourceType)))
+    );
     if (needed.size === 0) return;
 
     this.dbg(`Pre-fetching nav IDs for ${needed.size} meetings`);
     const baseUrl = this.auth.baseUrl;
-    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary`);
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
 
     // Wait for SPA table
     await this.waitForCondition(`
       !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
          document.querySelector('.zm-table__body tbody tr'))
     `, 15000);
+
+    // Reset to page 1 in case the SPA stayed on a later page
+    await this.resetToFirstPage();
 
     let currentPageNum = 1;
 
@@ -439,9 +612,11 @@ export class ZoomClient {
           );
           var found = [];
           for (var i = 0; i < rows.length; i++) {
-            var idCell = rows[i].querySelector('td:nth-child(3)');
-            var cellText = (idCell ? idCell.textContent : '').replace(/[\\s-]/g, '');
-            if (ids.indexOf(cellText) !== -1) found.push(cellText);
+            var cells = rows[i].querySelectorAll('td');
+            for (var j = 0; j < cells.length; j++) {
+              var cellText = (cells[j].textContent || '').replace(/[\\s-]/g, '');
+              if (ids.indexOf(cellText) !== -1) { found.push(cellText); break; }
+            }
           }
           return found;
         })()
@@ -458,8 +633,12 @@ export class ZoomClient {
               '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr'
             );
             for (var i = 0; i < rows.length; i++) {
-              var idCell = rows[i].querySelector('td:nth-child(3)');
-              if ((idCell ? idCell.textContent : '').replace(/[\\s-]/g, '') === id) {
+              var cells = rows[i].querySelectorAll('td');
+              var match = false;
+              for (var j = 0; j < cells.length; j++) {
+                if ((cells[j].textContent || '').replace(/[\\s-]/g, '') === id) { match = true; break; }
+              }
+              if (match) {
                 var btn = rows[i].querySelector('button.topic-link');
                 if (btn) { btn.click(); return true; }
               }
@@ -478,14 +657,15 @@ export class ZoomClient {
           const hash = await this.execInWindow<string>(`window.location.hash`);
           const entry = this.parseDetailHash(hash);
           if (entry) {
-            this.navIdCache.set(numericId, entry);
+            if (sourceType === 'shared') entry.isShared = true;
+            this.navIdCache.set(this.navCacheKey(numericId, sourceType), entry);
             needed.delete(numericId);
-            this.dbg(`Cached nav IDs for ${numericId}`);
+            this.dbg(`Cached nav IDs for ${numericId} (isShared=${entry.isShared})`);
           }
         }
 
         // Navigate back to list
-        await this.execInWindow<void>(`window.location.hash = '#/'`);
+        await this.execInWindow<void>(`window.location.hash = '#/${hashFragment}'`);
         await this.waitForCondition(`
           !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
              document.querySelector('.zm-table__body tbody tr'))
@@ -562,6 +742,93 @@ export class ZoomClient {
   }
 
   /**
+   * Resolve nav IDs by topic text as a fallback for shared pages where numeric
+   * meeting IDs can be unreliable/missing in table columns.
+   */
+  private async resolveNavIdByTopic(
+    topicHint: string,
+    sourceType: 'owned' | 'shared' = 'owned'
+  ): Promise<NavIdEntry | null> {
+    const target = this.normalizeTopic(topicHint);
+    if (!target) return null;
+
+    const baseUrl = this.auth.baseUrl;
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
+
+    const tableReady = await this.waitForCondition(`
+      !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
+         document.querySelector('.zm-table__body tbody tr'))
+    `, 15000);
+    if (!tableReady) return null;
+
+    // Reset to page 1 in case the SPA stayed on a later page
+    await this.resetToFirstPage();
+
+    while (true) {
+      const matchAndClick = await this.execInWindow<boolean>(`
+        (function() {
+          var target = ${JSON.stringify(target)};
+          var norm = function(s) { return (s || '').toLowerCase().replace(/\\s+/g, ' ').trim(); };
+          var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr');
+          for (var i = 0; i < rows.length; i++) {
+            var topicEl = rows[i].querySelector('button.topic-link, a.topic-link, td:first-child button, td:first-child a, td:first-child');
+            var rowTopic = norm(topicEl ? topicEl.textContent : '');
+            if (rowTopic === target) {
+              var btn = rows[i].querySelector('button.topic-link, a.topic-link, td:first-child button, td:first-child a');
+              if (btn) { btn.click(); return true; }
+            }
+          }
+          return false;
+        })()
+      `);
+
+      if (matchAndClick) {
+        this.dbg(`[resolveNavIdByTopic] Row matched for "${topicHint}" (${sourceType}), waiting for #/detail...`);
+        const navigated = await this.waitForCondition(
+          `window.location.hash.startsWith('#/detail')`,
+          10000
+        );
+        const finalHash = await this.execInWindow<string>(`window.location.hash`);
+        this.dbg(`[resolveNavIdByTopic] navigated=${navigated} hash="${finalHash}"`);
+        if (!navigated) return null;
+
+        const hash = await this.execInWindow<string>(`window.location.hash`);
+        const entry = this.parseDetailHash(hash);
+        if (entry && sourceType === 'shared') entry.isShared = true;
+        return entry;
+      }
+
+      const hasNext = await this.execInWindow<boolean>(`
+        (function() {
+          var btn = document.querySelector('button.btn-next');
+          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+        })()
+      `);
+      if (!hasNext) break;
+
+      const currentPage = await this.execInWindow<string | null>(`
+        (function() {
+          var active = document.querySelector('.zm-pager li.number.active');
+          return active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
+        })()
+      `);
+
+      await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
+      await this.waitForCondition(`
+        (function() {
+          var active = document.querySelector('.zm-pager li.number.active');
+          var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
+          return !!p && p !== ${JSON.stringify(currentPage)};
+        })()
+      `, 15000);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    return null;
+  }
+
+  /**
    * Find a specific numeric meeting ID in a page's table and extract
    * its nav IDs from the detail link/hash.
    * Used as fallback when BrowserWindow scraping isn't needed.
@@ -577,9 +844,12 @@ export class ZoomClient {
     if (!bodyTable) return null;
 
     for (const row of Array.from(bodyTable.querySelectorAll("tbody tr"))) {
-      const idCell = row.querySelector("td:nth-child(3)");
-      const cellText = idCell?.textContent?.replace(/[\s-]/g, "") ?? "";
-      if (cellText === numericId) {
+      const cells = row.querySelectorAll("td");
+      let cellMatch = false;
+      for (const cell of Array.from(cells)) {
+        if ((cell.textContent ?? "").replace(/[\s-]/g, "") === numericId) { cellMatch = true; break; }
+      }
+      if (cellMatch) {
         return this.extractNavIdFromRow(row);
       }
     }
@@ -643,15 +913,31 @@ export class ZoomClient {
   /**
    * Fetch the full summary for a meeting via Zoom's internal REST API.
    */
-  async getSummary(meetingId: string): Promise<MeetingSummaryDetail> {
+  async getSummary(
+    meetingId: string,
+    sourceType: 'owned' | 'shared' = 'owned',
+    topicHint?: string,
+    dateHint?: string
+  ): Promise<MeetingSummaryDetail> {
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
+    const cacheKey = this.navCacheKey(numericId, sourceType, dateHint);
 
     // Resolve the UUID-based meeting ID and summary ID
-    let navEntry: NavIdEntry | undefined = this.navIdCache.get(numericId);
+    let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
-      navEntry = (await this.resolveNavId(numericId)) ?? undefined;
+      this.dbg(`[getSummary] No cached navEntry for ${numericId} (${sourceType}) dateHint=${dateHint}. Resolving by ID...`);
+      navEntry = (await this.resolveNavId(numericId, sourceType, dateHint)) ?? undefined;
+      if (!navEntry && topicHint) {
+        this.dbg(`[getSummary] resolveNavId by numeric ID failed for ${numericId}; retrying by topic: ${topicHint}`);
+        navEntry = (await this.resolveNavIdByTopic(topicHint, sourceType)) ?? undefined;
+        if (navEntry) {
+          if (sourceType === 'shared') navEntry.isShared = true;
+          this.navIdCache.set(cacheKey, navEntry);
+        }
+      }
       if (!navEntry) {
+        this.dbg(`[getSummary] FAILED to resolve navEntry for ${numericId} (${sourceType})`);
         return {
           meeting_id: meetingId,
           meeting_topic: "",
@@ -659,18 +945,41 @@ export class ZoomClient {
         };
       }
     }
+    this.dbg(`[getSummary] navEntry for ${numericId} date=${dateHint}: meetingId=${navEntry.uuidMeetingId} summaryId=${navEntry.summaryId} isShared=${navEntry.isShared}`);
 
-    const apiUrl = `${baseUrl}/rest/meeting/web_view_summary?meetingId=${encodeURIComponent(navEntry.uuidMeetingId)}&summaryId=${encodeURIComponent(navEntry.summaryId)}&from=`;
+    const apiUrl = `${baseUrl}/rest/meeting/web_view_summary?meetingId=${encodeURIComponent(navEntry.uuidMeetingId)}&summaryId=${encodeURIComponent(navEntry.summaryId)}&from=${navEntry.isShared ? '&isShared=true' : ''}`;
 
-    const res = await this.zoomFetch(apiUrl, {
-      headers: { Accept: "application/json" },
-    });
-    const apiResponse = JSON.parse(res.body) as {
-      status: boolean;
-      result?: Record<string, unknown>;
-    };
+    this.dbg(`[getSummary] Fetching REST API: ${apiUrl}`);
+
+    // Use in-browser fetch (via the scrape window) — this has the full session
+    // cookies and CSRF tokens that nodeRequest may lack for shared summaries.
+    let apiResponse: { status: boolean; result?: Record<string, unknown> };
+    try {
+      apiResponse = await this.execInWindow<{ status: boolean; result?: Record<string, unknown> }>(`
+        fetch(${JSON.stringify(apiUrl)}, {
+          credentials: 'include',
+          headers: { 'Accept': 'application/json' }
+        }).then(function(r) { return r.json(); })
+      `);
+      this.dbg(`[getSummary] In-browser fetch result: status=${apiResponse?.status} hasResult=${!!apiResponse?.result} keys=${apiResponse?.result ? Object.keys(apiResponse.result).join(',') : 'none'}`);
+    } catch (browserFetchErr) {
+      this.dbg(`[getSummary] In-browser fetch failed (${(browserFetchErr as Error).message}), falling back to nodeRequest...`);
+      // Fallback to nodeRequest
+      const res = await this.zoomFetch(apiUrl, {
+        headers: { Accept: "application/json" },
+      });
+      this.dbg(`[getSummary] nodeRequest status=${res.status} bodyLen=${res.body.length}`);
+      if (this.debug) {
+        this.dbg(`[getSummary] nodeRequest body (first 500): ${res.body.substring(0, 500)}`);
+      }
+      apiResponse = JSON.parse(res.body);
+    }
 
     if (!apiResponse?.status || !apiResponse?.result) {
+      this.dbg(
+        `[getSummary] Empty API result for ${meetingId} (${sourceType}) ` +
+          `status=${String(apiResponse?.status)}`
+      );
       return {
         meeting_id: meetingId,
         meeting_topic: "",
@@ -680,6 +989,12 @@ export class ZoomClient {
     }
 
     const r = apiResponse.result;
+    this.dbg(
+      `[getSummary] ${sourceType} ${meetingId} fields: ` +
+        `overview=${Boolean((r.summaryOverview ?? r.overview ?? "").toString().trim())} ` +
+        `sections=${Array.isArray(r.summaryItemVOs) ? r.summaryItemVOs.length : 0} ` +
+        `steps=${Array.isArray(r.stepList ?? r.nextStepList) ? (r.stepList ?? r.nextStepList as unknown[]).length : 0}`
+    );
     return {
       meeting_id: meetingId,
       meeting_topic: (r.topic ?? r.meetingTopic ?? "") as string,
@@ -711,10 +1026,11 @@ export class ZoomClient {
   ): Promise<{ success: boolean; message: string }> {
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
+    const cacheKey = this.navCacheKey(numericId, 'owned');
 
-    let navEntry: NavIdEntry | undefined = this.navIdCache.get(numericId);
+    let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
-      navEntry = (await this.resolveNavId(numericId)) ?? undefined;
+      navEntry = (await this.resolveNavId(numericId, 'owned')) ?? undefined;
       if (!navEntry) {
         return {
           success: true,
@@ -745,8 +1061,8 @@ export class ZoomClient {
     if (!deleteButtonReady) {
       this.dbg(`[delete] Delete button not found — may already be deleted`);
       // Maybe stale cache — evict and re-resolve
-      this.navIdCache.delete(numericId);
-      const retryNav = await this.resolveNavId(numericId);
+      this.navIdCache.delete(cacheKey);
+      const retryNav = await this.resolveNavId(numericId, 'owned');
       if (!retryNav) {
         return {
           success: true,
@@ -860,7 +1176,7 @@ export class ZoomClient {
     }
 
     if (uiDeleteSucceeded) {
-      this.navIdCache.delete(numericId);
+      this.navIdCache.delete(cacheKey);
       return { success: true, message: `Deleted summary for meeting ${meetingId}.` };
     }
 

@@ -71,6 +71,7 @@ export interface ZoomSummaryData {
 export interface NavIdEntry {
   uuidMeetingId: string;
   summaryId: string;
+  isShared?: boolean;
 }
 
 /** Plugin settings stored in data.json. */
@@ -85,6 +86,8 @@ export interface ZoomObsidianSettings {
   filter: string;
   /** Enable debug logging to console. */
   debug: boolean;
+  /** Folder for shared Zoom meetings (optional). If not set, shared meetings are not processed. */
+  sharedMeetingsFolder: string;
 }
 
 export interface SerializedCookie {
@@ -105,4 +108,13 @@ export const DEFAULT_SETTINGS: ZoomObsidianSettings = {
   cookies: [],
   filter: "",
   debug: false,
+  sharedMeetingsFolder: "",
 };
+
+/** Per-source config file state (separate from data.json). */
+export interface ObsidianConfigState {
+  lastProcessedOwned?: string; // ISO timestamp
+  lastProcessedShared?: string; // ISO timestamp
+}
+
+export const DEFAULT_CONFIG_STATE: ObsidianConfigState = {};

@@ -55,13 +55,19 @@ export class ZoomSummariesClient {
   /**
    * List all meeting summaries by navigating to the summaries page
    * and scraping all pages via the zm-pagination next-page button.
+   * 
+   * @param sourceType - 'owned' for user's own meetings (#/list), 'shared' for meetings shared with user (#/summaryShare)
    */
-  async listSummaries(options: {
-    from?: string;
-    to?: string;
-  } = {}): Promise<MeetingSummaryItem[]> {
+  async listSummaries(
+    sourceType: 'owned' | 'shared' = 'owned',
+    options: {
+      from?: string;
+      to?: string;
+    } = {}
+  ): Promise<MeetingSummaryItem[]> {
     const baseUrl = this.browser.baseUrl;
-    let url = `${baseUrl}/user/meeting/summary#/`;
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    let url = `${baseUrl}/user/meeting/summary#/${hashFragment}`;
 
     const page = await this.browser.navigateTo(url);
 
@@ -70,12 +76,21 @@ export class ZoomSummariesClient {
       const filterUrl = new URL(`${baseUrl}/user/meeting/summary`);
       if (options.from) filterUrl.searchParams.set("from", options.from);
       if (options.to) filterUrl.searchParams.set("to", options.to);
-      await page.goto(filterUrl.toString(), { waitUntil: "networkidle2", timeout: 30000 });
+      await page.goto(`${filterUrl.toString()}#/${hashFragment}`, { waitUntil: "networkidle2", timeout: 30000 });
+    }
+
+    // Defensive: ensure router stayed on expected hash route.
+    const expectedHash = `#/${hashFragment}`;
+    const currentHash = await page.evaluate(() => window.location.hash || "");
+    if (!currentHash.startsWith(expectedHash)) {
+      this.dbg(`[listSummaries] Hash mismatch (have="${currentHash}", want="${expectedHash}") — forcing route`);
+      await page.evaluate((h: string) => { window.location.hash = h; }, expectedHash);
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     // Wait for Zoom's table body to render (zm-table__body-wrapper holds the data rows)
     await page.waitForSelector(
-      ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr",
+      ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, .zm-table__empty, .zm-empty-state, .empty-state",
       { timeout: 15000 }
     ).catch(() => {});
 
@@ -92,13 +107,18 @@ export class ZoomSummariesClient {
 
       table.querySelectorAll("tbody tr").forEach((row) => {
         const cells = row.querySelectorAll("td");
-        const topicBtn = row.querySelector<HTMLButtonElement>("button.topic-link");
+        const topicBtn = row.querySelector<HTMLButtonElement>(
+          "button.topic-link, a.topic-link, td:first-child button, td:first-child a"
+        );
         const item: Record<string, unknown> = {};
         if (topicBtn) item.meeting_topic = topicBtn.textContent?.trim();
         cells.forEach((cell, i) => {
           const text = cell.textContent?.trim();
           if (text) item[`column_${i}`] = text;
         });
+        if (!item.meeting_topic && cells[0]?.textContent?.trim()) {
+          item.meeting_topic = cells[0].textContent.trim();
+        }
         if (Object.keys(item).length > 0) results.push(item);
       });
       return results;
@@ -158,19 +178,23 @@ export class ZoomSummariesClient {
    * Returns null if the meeting is not found.
    */
   private async navigateToDetail(
-    numericId: string
+    numericId: string,
+    sourceType: 'owned' | 'shared' = 'owned',
+    dateHint?: string
   ): Promise<{ page: import("puppeteer").Page; uuidMeetingId: string; summaryId: string } | null> {
     const baseUrl = this.browser.baseUrl;
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
     // Navigate WITHOUT a hash so the SPA always does a full page reload.
     // Using the hash-only URL (e.g. #/) when already on the same SPA page results
     // in a no-op navigation (hash change only) and the table never re-renders.
-    const page = await this.browser.navigateTo(`${baseUrl}/user/meeting/summary`);
+    const page = await this.browser.navigateTo(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
     page.setDefaultNavigationTimeout(10000);
     page.setDefaultTimeout(10000);
     // Wait for the hash to settle to "#/" (the SPA router should redirect there)
     await page.waitForFunction(
-      () => window.location.hash === "" || window.location.hash === "#/" || window.location.hash.startsWith("#/?"),
-      { timeout: 5000 }
+      (expectedHash: string) => window.location.hash.startsWith(expectedHash),
+      { timeout: 5000 },
+      `#/${hashFragment}`
     ).catch(() => {});
     await page.waitForSelector(".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr", { timeout: 15000 }).catch(() => {});
 
@@ -191,21 +215,35 @@ export class ZoomSummariesClient {
 
     let found = false;
     while (!found) {
-      found = await page.evaluate((id: string) => {
+      found = await page.evaluate((id: string, dh: string) => {
         const rows = Array.from(document.querySelectorAll<HTMLTableRowElement>(
           ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr"
         ));
+        const candidates: HTMLTableRowElement[] = [];
         for (const row of rows) {
-          const idCell = row.querySelector("td:nth-child(3)");
-          const cellText = idCell?.textContent?.replace(/[\s-]/g, "") ?? "";
-          if (cellText === id) {
-            const btn = row.querySelector<HTMLButtonElement>("button.topic-link");
-            btn?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-            return true;
+          const cells = row.querySelectorAll("td");
+          let match = false;
+          for (const cell of Array.from(cells)) {
+            if ((cell.textContent ?? "").replace(/[\s-]/g, "") === id) { match = true; break; }
           }
+          if (match) candidates.push(row);
         }
-        return false;
-      }, numericId);
+        if (candidates.length === 0) return false;
+
+        let target: HTMLTableRowElement | null = null;
+        if (dh) {
+          // When dateHint is provided, ONLY click if a row contains that date text.
+          for (const c of candidates) {
+            if ((c.textContent ?? "").includes(dh)) { target = c; break; }
+          }
+          if (!target) return false; // candidates exist but none match date — paginate
+        } else {
+          target = candidates[0];
+        }
+        const btn = target.querySelector<HTMLButtonElement>("button.topic-link");
+        btn?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        return true;
+      }, numericId, dateHint ?? "");
 
       if (found) break;
 
@@ -255,7 +293,11 @@ export class ZoomSummariesClient {
    * extracts the UUID-based meetingId and summaryId from the hash URL, then calls
    * the internal REST API directly.
    */
-  async getSummary(meetingId: string): Promise<MeetingSummaryDetail> {
+  async getSummary(
+    meetingId: string,
+    sourceType: 'owned' | 'shared' = 'owned',
+    dateHint?: string
+  ): Promise<MeetingSummaryDetail> {
     const baseUrl = this.browser.baseUrl;
     const numericId = meetingId.replace(/[\s-]/g, "");
 
@@ -270,14 +312,15 @@ export class ZoomSummariesClient {
       ({ uuidMeetingId, summaryId } = cached);
       page = await this.browser.ensureAuthenticated();
     } else {
-      const detail = await this.navigateToDetail(numericId);
+      const detail = await this.navigateToDetail(numericId, sourceType, dateHint);
       if (!detail) {
         return { meeting_id: meetingId, error: `Meeting ${meetingId} not found in summaries list.` } as unknown as MeetingSummaryDetail;
       }
       ({ page, uuidMeetingId, summaryId } = detail);
     }
 
-    const apiUrl = `${baseUrl}/rest/meeting/web_view_summary?meetingId=${encodeURIComponent(uuidMeetingId)}&summaryId=${encodeURIComponent(summaryId)}&from=`;
+    const isShared = sourceType === 'shared';
+    const apiUrl = `${baseUrl}/rest/meeting/web_view_summary?meetingId=${encodeURIComponent(uuidMeetingId)}&summaryId=${encodeURIComponent(summaryId)}&from=${isShared ? '&isShared=true' : ''}`;
     const apiResponse = await page.evaluate(async (url: string) => {
       const res = await fetch(url, { credentials: "include" });
       return res.json();
@@ -306,18 +349,23 @@ export class ZoomSummariesClient {
    * back to the list using direct page-number buttons when available.
    * Call this before getSummary to collapse N list traversals into one.
    */
-  async prefetchNavIds(numericIds: string[]): Promise<void> {
+  async prefetchNavIds(
+    numericIds: string[],
+    sourceType: 'owned' | 'shared' = 'owned'
+  ): Promise<void> {
     const needed = new Set(numericIds.filter(id => !this.navIdCache.has(id)));
     if (needed.size === 0) return;
 
     this.dbg(`[prefetch] Pre-fetching nav IDs for ${needed.size} meetings`);
     const baseUrl = this.browser.baseUrl;
-    const page = await this.browser.navigateTo(`${baseUrl}/user/meeting/summary`);
+    const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
+    const page = await this.browser.navigateTo(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
     page.setDefaultTimeout(10000);
 
     await page.waitForFunction(
-      () => window.location.hash === "" || window.location.hash === "#/" || window.location.hash.startsWith("#/?"),
-      { timeout: 5000 }
+      (expectedHash: string) => window.location.hash.startsWith(expectedHash),
+      { timeout: 5000 },
+      `#/${hashFragment}`
     ).catch(() => {});
     await page.waitForSelector(
       ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr",
@@ -333,8 +381,14 @@ export class ZoomSummariesClient {
           ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr"
         ));
         return rows
-          .map(row => row.querySelector("td:nth-child(3)")?.textContent?.replace(/[\s-]/g, "") ?? "")
-          .filter(id => ids.includes(id));
+          .map(row => {
+            for (const cell of Array.from(row.querySelectorAll("td"))) {
+              const t = (cell.textContent ?? "").replace(/[\s-]/g, "");
+              if (ids.includes(t)) return t;
+            }
+            return "";
+          })
+          .filter(id => id !== "");
       }, [...needed]) as string[];
 
       this.dbg(`[prefetch] Page ${currentPageNum}: found ${pageIds.length} needed rows`);
@@ -346,7 +400,12 @@ export class ZoomSummariesClient {
             ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr"
           ));
           for (const row of rows) {
-            if (row.querySelector("td:nth-child(3)")?.textContent?.replace(/[\s-]/g, "") === id) {
+            const cells = row.querySelectorAll("td");
+            let match = false;
+            for (const cell of Array.from(cells)) {
+              if ((cell.textContent ?? "").replace(/[\s-]/g, "") === id) { match = true; break; }
+            }
+            if (match) {
               (row.querySelector<HTMLButtonElement>("button.topic-link"))?.click();
               return true;
             }
@@ -373,7 +432,7 @@ export class ZoomSummariesClient {
         }
 
         // Navigate back to the list
-        await page.evaluate(() => { window.location.hash = "#/"; });
+        await page.evaluate((targetHash: string) => { window.location.hash = targetHash; }, `#/${hashFragment}`);
         await page.waitForSelector(
           ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr",
           { timeout: 10000 }
@@ -396,7 +455,7 @@ export class ZoomSummariesClient {
           if (actualPage > currentPageNum) {
             // SPA ended up past where we need to be — do a fresh load to reset to page 1
             this.dbg(`[prefetch] Overshot (page ${actualPage} > ${currentPageNum}), doing fresh load`);
-            await page.goto(`${baseUrl}/user/meeting/summary`, { waitUntil: "domcontentloaded", timeout: 15000 });
+            await page.goto(`${baseUrl}/user/meeting/summary#/${hashFragment}`, { waitUntil: "domcontentloaded", timeout: 15000 });
             await page.waitForSelector(
               ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr",
               { timeout: 10000 }
@@ -504,7 +563,7 @@ export class ZoomSummariesClient {
       if (!deleteButtonPresent) {
         this.dbg(`[delete] Delete button not found on cached detail URL — evicting cache entry and re-scraping list`);
         this.navIdCache.delete(numericId);
-        const detail = await this.navigateToDetail(numericId);
+        const detail = await this.navigateToDetail(numericId, 'owned');
         if (!detail) {
           console.error(`[delete] navigateToDetail returned null after cache miss — already deleted`);
           return { success: true, message: `Meeting ${meetingId} not found in summaries list (already deleted).` };
@@ -514,7 +573,7 @@ export class ZoomSummariesClient {
         ({ uuidMeetingId, summaryId } = cached);
       }
     } else {
-      const detail = await this.navigateToDetail(numericId);
+      const detail = await this.navigateToDetail(numericId, 'owned');
       if (!detail) {
         console.error(`[delete] navigateToDetail returned null — meeting not found in list (already deleted?)`);
         // Treat as success: if the meeting isn't in the list it was already cleaned up

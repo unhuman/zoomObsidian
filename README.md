@@ -25,6 +25,7 @@ npm run build
 | `OBSIDIAN_VAULT_PATH` | Absolute path to your Obsidian vault root | _(required)_ |
 | `VAULT_SUBFOLDER` | Subfolder within the vault containing 1:1 note folders (e.g. `MyOrg`) | *(empty — search directly under vault root)* |
 | `ONE_ON_ONE_FOLDERS` | Comma-separated list of folder names holding 1:1 notes | `! One on Ones, ! One on Ones (Other)` |
+| `SHARED_MEETINGS_FOLDER` | (Optional, v1.1.0+) Folder for meetings shared WITH you. If not set, shared meetings are not processed. | *(empty)* |
 
 ## Usage with Claude Desktop
 
@@ -77,10 +78,11 @@ Opens a browser window for you to sign into Zoom. Call this first if you get aut
 
 ### `list_meeting_summaries`
 
-List meeting summaries with optional date filtering.
+List meeting summaries with optional source and date filtering.
 
 | Parameter | Type | Description |
 |---|---|---|
+| `source` | string (optional) | `owned` (default) or `shared` |
 | `from` | string (optional) | Start date (e.g. `2025-01-01`) |
 | `to` | string (optional) | End date (e.g. `2025-02-01`) |
 

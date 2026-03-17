@@ -41,6 +41,14 @@ export class VaultWriter {
   }
 
   /**
+   * Sanitize a filename by replacing invalid characters with dashes.
+   * Invalid characters: < > : " / \ | ? *
+   */
+  private sanitizeFilename(name: string): string {
+    return name.replace(/[<>:"\/\\|?*]/g, "-").trim();
+  }
+
+  /**
    * Load (and cache) all .md files from the 1:1 folders.
    * Returns objects with `name` (no extension) and vault-relative `path`.
    */
@@ -249,10 +257,16 @@ export class VaultWriter {
 
   /**
    * Format the summary as a standalone dated section.
+   *
+   * If hasMeetingIdSuffix is true, appends " (ID: {meeting_id})" to the date header
+   * to distinguish same-named meetings occurring on the same date.
    */
-  formatSummarySection(dateStr: string, summary: ZoomSummaryData): string {
+  formatSummarySection(dateStr: string, summary: ZoomSummaryData, hasMeetingIdSuffix = false): string {
+    const headerDate = hasMeetingIdSuffix 
+      ? `${dateStr} - Zoom AI Summary (ID: ${summary.meeting_id})`
+      : `${dateStr} - Zoom AI Summary`;
     return (
-      `${dateStr} - Zoom AI Summary\n` +
+      `${headerDate}\n` +
       this.formatSummaryBody(summary, "", false)
     );
   }
@@ -260,6 +274,9 @@ export class VaultWriter {
   /**
    * Insert the formatted summary into the file at the correct chronological
    * position (newest-first), creating the file if it doesn't exist.
+   *
+   * If another Zoom summary with the same date already exists, appends an ID suffix
+   * to distinguish them (e.g., "2026-03-17 - Zoom AI Summary (ID: 12345)").
    *
    * Returns { inserted, position, filePath }.
    */
@@ -280,16 +297,18 @@ export class VaultWriter {
       content = await this.app.vault.read(existingFile);
     } else {
       // File doesn't exist — create with standalone section
-      const newSection = this.formatSummarySection(dateStr, summary);
+      const newSection = this.formatSummarySection(dateStr, summary, false);
       await this.ensureParentFolder(normalizedPath);
       await this.app.vault.create(normalizedPath, newSection);
       return { inserted: true, position: "top", filePath: normalizedPath };
     }
 
     // Idempotency: already written with content — skip
-    const hasHeader =
-      content.includes(`${dateStr} - Zoom AI Summary`) ||
-      this.dateBlockContains(content, dateStr, "Zoom AI Summary");
+    const headerRegex = new RegExp(
+      `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`,
+      "m"
+    );
+    const hasHeader = headerRegex.test(content) || this.dateBlockContains(content, dateStr, "Zoom AI Summary");
     if (hasHeader && !this.zoomBlockIsEmpty(content, dateStr)) {
       return { inserted: false, position: "top", filePath: normalizedPath };
     }
@@ -298,12 +317,12 @@ export class VaultWriter {
     if (hasHeader && this.zoomBlockIsEmpty(content, dateStr)) {
       content = content
         .replace(
-          /^.*\d{4}-\d{2}-\d{2}.*Zoom AI Summary[ \t]*\n(\n)?/m,
+          /^.*\d{4}-\d{2}-\d{2}.*Zoom AI Summary.*\n(\n)?/m,
           ""
         )
         .trimStart();
       if (!content.trim()) {
-        const newSection = this.formatSummarySection(dateStr, summary);
+        const newSection = this.formatSummarySection(dateStr, summary, false);
         await this.app.vault.modify(existingFile, newSection);
         return { inserted: true, position: "top", filePath: normalizedPath };
       }
@@ -312,12 +331,18 @@ export class VaultWriter {
     const lines = content.split("\n");
     const dateRegex = /^\d{4}-\d{2}-\d{2}/;
 
+    // Check if another Zoom summary with the same date already exists in the file
+    const existingSameDateZoomHeaderRegex = new RegExp(
+      `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`
+    );
+    const hasSameDateZoom = lines.some((l) => existingSameDateZoomHeaderRegex.test(l));
+
     // Same-date merge
     const sameDateIdx = lines.findIndex(
       (l) => l.startsWith(dateStr) && dateRegex.test(l)
     );
 
-    if (sameDateIdx !== -1) {
+    if (sameDateIdx !== -1 && !hasSameDateZoom) {
       let blockEnd = lines.length;
       for (let i = sameDateIdx + 1; i < lines.length; i++) {
         if (dateRegex.test(lines[i])) {
@@ -341,7 +366,9 @@ export class VaultWriter {
     }
 
     // Chronological insertion (newest-first)
-    const newSection = this.formatSummarySection(dateStr, summary);
+    // If same-date Zoom summary exists, add ID suffix to distinguish
+    const needsIdSuffix = hasSameDateZoom;
+    const newSection = this.formatSummarySection(dateStr, summary, needsIdSuffix);
     let insertLineIdx: number | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (dateRegex.test(lines[i])) {

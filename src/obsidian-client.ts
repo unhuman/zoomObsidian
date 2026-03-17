@@ -45,6 +45,14 @@ export class ObsidianClient {
     this.oneOnOneFolders = options.oneOnOneFolders ?? DEFAULT_ONE_ON_ONE_FOLDERS;
   }
 
+  /**
+   * Sanitize a filename by replacing invalid characters with dashes.
+   * Invalid characters: < > : " / \ | ? *
+   */
+  private sanitizeFilename(name: string): string {
+    return name.replace(/[<>:"\/\\|?*]/g, "-").trim();
+  }
+
   /** Load (and cache) all .md files from both 1:1 folders. */
   async allFiles(): Promise<{ name: string; path: string }[]> {
     if (this._fileCache) return this._fileCache;
@@ -254,14 +262,23 @@ export class ObsidianClient {
   /**
    * Format the summary as a standalone dated section (used only when the date
    * does not yet appear in the file at all).
+   * 
+   * If hasMeetingIdSuffix is true, appends " (ID: {meeting_id})" to the date header
+   * to distinguish same-named meetings occurring on the same date.
    */
-  formatSummarySection(dateStr: string, summary: ZoomSummaryData): string {
-    return `${dateStr} - Zoom AI Summary\n` + this.formatSummaryBody(summary, "", false);
+  formatSummarySection(dateStr: string, summary: ZoomSummaryData, hasMeetingIdSuffix = false): string {
+    const headerDate = hasMeetingIdSuffix 
+      ? `${dateStr} - Zoom AI Summary (ID: ${summary.meeting_id})`
+      : `${dateStr} - Zoom AI Summary`;
+    return `${headerDate}\n` + this.formatSummaryBody(summary, "", false);
   }
 
   /**
    * Insert the formatted section into the file at the correct chronological position
    * (newest-first), creating the file if it doesn't exist.
+   * 
+   * If another Zoom summary with the same date already exists, appends an ID suffix
+   * to distinguish them (e.g., "2026-03-17 - Zoom AI Summary (ID: 12345)").
    */
   async insertSummary(
     filePath: string,
@@ -273,26 +290,28 @@ export class ObsidianClient {
       content = await readFile(filePath, "utf-8");
     } catch {
       // File doesn't exist — create with standalone section
-      const newSection = this.formatSummarySection(dateStr, summary);
+      const newSection = this.formatSummarySection(dateStr, summary, false);
       await writeFile(filePath, newSection, "utf-8");
       return { inserted: true, position: "top", filePath };
     }
 
     // Idempotency: already written with actual content — skip
     // But allow rewrite if a bare header exists with no body (previous bug)
-    const hasHeader =
-      content.includes(`${dateStr} - Zoom AI Summary`) ||
-      this.dateBlockContains(content, dateStr, "Zoom AI Summary");
+    const headerRegex = new RegExp(
+      `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`,
+      "m"
+    );
+    const hasHeader = headerRegex.test(content) || this.dateBlockContains(content, dateStr, "Zoom AI Summary");
     if (hasHeader && !this.zoomBlockIsEmpty(content, dateStr)) {
       return { inserted: false, position: "top", filePath };
     }
 
     // If a bare header exists with no body, strip it so we can rewrite cleanly
     if (hasHeader && this.zoomBlockIsEmpty(content, dateStr)) {
-      content = content.replace(/^.*\d{4}-\d{2}-\d{2}.*Zoom AI Summary[ \t]*\n(\n)?/m, "").trimStart();
+      content = content.replace(/^.*\d{4}-\d{2}-\d{2}.*Zoom AI Summary.*\n(\n)?/m, "").trimStart();
       // If the file becomes empty after stripping, write fresh
       if (!content.trim()) {
-        const newSection = this.formatSummarySection(dateStr, summary);
+        const newSection = this.formatSummarySection(dateStr, summary, false);
         await writeFile(filePath, newSection, "utf-8");
         return { inserted: true, position: "top", filePath };
       }
@@ -301,12 +320,18 @@ export class ObsidianClient {
     const lines = content.split("\n");
     const dateRegex = /^\d{4}-\d{2}-\d{2}/;
 
-    // Check if the same date already exists (manual notes) — if so, append under it
+    // Check if another Zoom summary with the same date already exists in the file
+    const existingSameDateZoomHeaderRegex = new RegExp(
+      `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`
+    );
+    const hasSameDateZoom = lines.some((l) => existingSameDateZoomHeaderRegex.test(l));
+
+    // Check if the same date already exists (for manual notes) — if so, append under it
     const sameDateIdx = lines.findIndex(
       (l) => l.startsWith(dateStr) && dateRegex.test(l)
     );
 
-    if (sameDateIdx !== -1) {
+    if (sameDateIdx !== -1 && !hasSameDateZoom) {
       // Find end of this date's block (next line at level 0 matching a date, or EOF)
       let blockEnd = lines.length;
       for (let i = sameDateIdx + 1; i < lines.length; i++) {
@@ -327,8 +352,10 @@ export class ObsidianClient {
       return { inserted: true, position: "middle", filePath };
     }
 
-    // Date not present — find chronological insertion point (newest-first)
-    const newSection = this.formatSummarySection(dateStr, summary);
+    // Date not present, or same-date Zoom summary already exists
+    // If same-date Zoom summary exists, add ID suffix to distinguish
+    const needsIdSuffix = hasSameDateZoom;
+    const newSection = this.formatSummarySection(dateStr, summary, needsIdSuffix);
     let insertLineIdx: number | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (dateRegex.test(lines[i])) {

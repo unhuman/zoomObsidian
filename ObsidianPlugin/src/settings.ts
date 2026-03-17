@@ -106,6 +106,21 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Folder for Shared Meetings")
+      .setDesc(
+        'Folder where shared Zoom meetings are written (optional). If left blank, shared meetings are not processed. Shared meetings cannot be deleted from Zoom.'
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Shared Meetings")
+          .setValue(this.plugin.settings.sharedMeetingsFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.sharedMeetingsFolder = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
     // ── Sync Settings ────────────────────────────────────────
 
     containerEl.createEl("h3", { text: "Sync Behavior" });
