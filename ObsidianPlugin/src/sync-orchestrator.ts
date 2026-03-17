@@ -42,6 +42,9 @@ export interface SyncReport {
   errors: number;
   deleted: number;
   deleteFailed: number;
+  /** Updated scan timestamps — caller should persist these. */
+  updatedLastProcessedOwned?: string;
+  updatedLastProcessedShared?: string;
 }
 
 export class SyncOrchestrator {
@@ -57,15 +60,26 @@ export class SyncOrchestrator {
   /** Progress callback for UI updates. */
   onProgress?: (message: string) => void;
 
+  /** Last-processed timestamps for incremental scans. */
+  private lastProcessedOwned?: string;
+  private lastProcessedShared?: string;
+
   constructor(
     client: ZoomClient,
     writer: VaultWriter,
-    opts?: { debug?: boolean; sharedMeetingsFolder?: string }
+    opts?: {
+      debug?: boolean;
+      sharedMeetingsFolder?: string;
+      lastProcessedOwned?: string;
+      lastProcessedShared?: string;
+    }
   ) {
     this.client = client;
     this.writer = writer;
     this.debug = opts?.debug ?? false;
     this.sharedMeetingsFolder = opts?.sharedMeetingsFolder;
+    this.lastProcessedOwned = opts?.lastProcessedOwned;
+    this.lastProcessedShared = opts?.lastProcessedShared;
   }
 
   private dbg(...args: unknown[]): void {
@@ -103,6 +117,11 @@ export class SyncOrchestrator {
       totalDeleteFailed = 0;
 
     const hasSharedFolder = !!this.sharedMeetingsFolder?.trim();
+    const runTimestamp = new Date().toISOString();
+
+    this.dbg(`[scan-dates] Run starting at ${runTimestamp}`);
+    this.dbg(`[scan-dates] lastProcessedOwned=${this.lastProcessedOwned ?? "(none)"}, lastProcessedShared=${this.lastProcessedShared ?? "(none)"}`);
+    this.dbg(`[scan-dates] filter=${filter || "(none)"}, autoDelete=${autoDelete}, hasSharedFolder=${hasSharedFolder}`);
 
     // Process owned meetings only when shared-only mode is not enabled.
     if (!hasSharedFolder) {
@@ -111,7 +130,8 @@ export class SyncOrchestrator {
         "owned",
         filter,
         autoDelete,
-        this.writer
+        this.writer,
+        this.lastProcessedOwned
       );
       allResults.push(...ownedReport.results);
       totalWritten += ownedReport.written;
@@ -137,7 +157,8 @@ export class SyncOrchestrator {
           "shared",
           filter,
           false, // never auto-delete shared meetings (Zoom API limitation)
-          sharedMeetingsWriter
+          sharedMeetingsWriter,
+          this.lastProcessedShared
         );
         allResults.push(...sharedReport.results);
         totalWritten += sharedReport.written;
@@ -161,6 +182,26 @@ export class SyncOrchestrator {
       deleteFailed: totalDeleteFailed,
     };
 
+    // Update scan timestamps.
+    // Owned: only advance when autoDelete is enabled (meetings are removed from
+    // Zoom, so they won't appear on the next list). Without delete, the same
+    // meetings persist and the timestamp must stay so they're re-scanned.
+    // Shared: only advance when NO topic filter is active, because a filter
+    // would skip non-matching meetings that haven't been processed yet.
+    // Shared meetings are never deleted, but each is written idempotently.
+    if (!hasSharedFolder && autoDelete) {
+      report.updatedLastProcessedOwned = runTimestamp;
+      this.dbg(`[scan-dates] Will advance lastProcessedOwned → ${runTimestamp}`);
+    } else if (!hasSharedFolder) {
+      this.dbg(`[scan-dates] NOT advancing lastProcessedOwned (autoDelete is off)`);
+    }
+    if (hasSharedFolder && !filter) {
+      report.updatedLastProcessedShared = runTimestamp;
+      this.dbg(`[scan-dates] Will advance lastProcessedShared → ${runTimestamp}`);
+    } else if (hasSharedFolder) {
+      this.dbg(`[scan-dates] NOT advancing lastProcessedShared (topic filter is active)`);
+    }
+
     const summary =
       `Sync complete: ${totalWritten} written, ${totalSkipped} skipped, ${totalErrors} errors` +
       (autoDelete
@@ -180,7 +221,8 @@ export class SyncOrchestrator {
     sourceType: "owned" | "shared",
     filter: string,
     autoDelete: boolean,
-    writer: VaultWriter
+    writer: VaultWriter,
+    fromDate?: string
   ): Promise<SyncReport> {
     const extractMeetingId = (m: MeetingSummaryItem): string => {
       const candidates = [
@@ -209,7 +251,12 @@ export class SyncOrchestrator {
 
     // Phase 1: list meetings
     this.progress(`Listing ${sourceType} meeting summaries...`);
-    const allMeetings = await this.client.listSummaries(sourceType as any);
+    const listOpts: { from?: string } = {};
+    if (fromDate) {
+      listOpts.from = fromDate;
+      this.dbg(`[list] Using fromDate=${fromDate} for ${sourceType}`);
+    }
+    const allMeetings = await this.client.listSummaries(sourceType as any, listOpts);
     const meetings = filter
       ? allMeetings.filter((m) =>
           (m.meeting_topic ?? (m as Record<string, unknown>).column_1 ?? "")
@@ -311,9 +358,9 @@ export class SyncOrchestrator {
         .toString()
         .replace(/^Select /, "");
       const rawId = extractMeetingId(m);
-      // Shared table: topic(0)/ID(1)/owner(2)/date(3). Owned: topic(0)/date(1)/ID(2).
-      const dateCol = sourceType === 'shared' ? 'column_3' : 'column_4';
-      const date = ((m as Record<string, unknown>)[dateCol] ?? (m as Record<string, unknown>).column_4 ?? (m as Record<string, unknown>).column_3 ?? "").toString().trim();
+      // Owned table: topic(0)/date(1)/ID(2). Shared table: topic(0)/ID(1)/owner(2)/date(3).
+      const dateCol = sourceType === 'shared' ? 'column_3' : 'column_1';
+      const date = ((m as Record<string, unknown>)[dateCol] ?? "").toString().trim();
       const attendees = attendeesMap.get(rawId) ?? [];
       const parsedDate = writer.parseMeetingDate(date);
       const instanceKey = `${rawId}__${parsedDate}`;

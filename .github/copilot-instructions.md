@@ -78,7 +78,9 @@ A self-contained Obsidian community plugin (desktop-only, `isDesktopOnly: true`)
 
 **Build tooling:** esbuild bundling to CJS (`main.js`), externals: `obsidian`, `electron`, `@electron/remote`, Node built-in modules. TypeScript strict mode, ES2022 target, bundler module resolution.
 
-**Settings persistence:** Plugin settings stored in `data.json` via Obsidian's `saveData()`/`loadData()`. Includes serialized Zoom cookies (no external cookie file needed).
+**Settings persistence:** Plugin settings stored in `data.json` via Obsidian's `saveData()`/`loadData()`. Includes serialized Zoom cookies (no external cookie file needed). Scan-state (last-processed timestamps) stored separately in `obsidian-config.json` within the plugin folder via `app.vault.adapter.write()`.
+
+**Incremental sync:** Each sync records a `lastProcessedOwned` / `lastProcessedShared` ISO timestamp. On the next run, `listSummaries()` receives a `from` date so only new meetings are fetched. When a **topic filter** is active, the shared-meetings scan date is **not** advanced — this prevents non-matching meetings from being permanently skipped on subsequent unfiltered runs. Owned meetings only advance the timestamp when **auto-delete** is enabled (deleted meetings won't reappear, so advancing is safe); without delete, the same meetings persist and must be re-scanned. Delete `obsidian-config.json` to force a full re-scan.
 
 ---
 

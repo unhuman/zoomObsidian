@@ -188,6 +188,8 @@ export default class ZoomObsidianPlugin extends Plugin {
     const orchestrator = new SyncOrchestrator(this.client, this.writer, {
       debug: this.settings.debug,
       sharedMeetingsFolder: this.settings.sharedMeetingsFolder || undefined,
+      lastProcessedOwned: this.configState.lastProcessedOwned,
+      lastProcessedShared: this.configState.lastProcessedShared,
     });
 
     // Show progress via Notice
@@ -203,6 +205,18 @@ export default class ZoomObsidianPlugin extends Plugin {
         autoDelete: this.settings.autoDelete,
       });
       lastNotice?.hide();
+
+      // Persist updated scan timestamps
+      if (report.updatedLastProcessedOwned) {
+        this.configState.lastProcessedOwned = report.updatedLastProcessedOwned;
+      }
+      if (report.updatedLastProcessedShared) {
+        this.configState.lastProcessedShared = report.updatedLastProcessedShared;
+      }
+      if (report.updatedLastProcessedOwned || report.updatedLastProcessedShared) {
+        await this.saveConfigState();
+      }
+
       new SyncReportModal(this.app, report).open();
     } catch (e) {
       lastNotice?.hide();

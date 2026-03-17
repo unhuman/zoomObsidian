@@ -88,7 +88,7 @@ After enabling the plugin, go to **Settings → Zoom Meeting Summaries**:
 | Setting | Description |
 |---------|-------------|
 | **Auto-delete from Zoom** | Delete each summary from Zoom after writing it to the vault. |
-| **Topic filter** | Only sync meetings whose topic contains this text (case-insensitive). Leave blank for all. |
+| **Topic filter** | Only sync meetings whose topic contains this text (case-insensitive). Leave blank for all. **Note:** When a topic filter is active, the scan date for shared meetings is not advanced, so non-matching shared meetings won't be skipped on subsequent unfiltered runs. |
 
 ### Advanced
 
@@ -115,10 +115,13 @@ Use any of these methods:
 - **Hotkey**: Assign a hotkey in Settings → Hotkeys.
 
 The sync will:
-1. Fetch all available meeting summaries from Zoom.
+1. Fetch meeting summaries from Zoom (incrementally — only meetings since the last successful sync).
 2. Match each meeting to a 1:1 note file in your vault.
 3. Write summaries into the correct files in chronological order.
 4. Show a results modal with what was written, skipped, or errored.
+5. Update the scan timestamp so future syncs only fetch new meetings.
+
+Scan timestamps are stored in `obsidian-config.json` inside the plugin folder (`lastProcessedOwned` and `lastProcessedShared`). Delete this file to force a full re-scan.
 
 ### Listing Summaries
 
