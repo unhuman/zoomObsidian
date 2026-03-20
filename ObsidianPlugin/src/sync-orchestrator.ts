@@ -464,6 +464,7 @@ export class SyncOrchestrator {
     this.progress("Fetching summaries...");
     // Use instanceKey (rawId__date) to distinguish recurring meeting instances
     const toFetchFull = new Map<string, { rawId: string; topic: string; dateHint: string }>();
+    const alreadyInVault = new Set<string>();
 
     const hasCachedContent = (key: string): boolean => {
       const s = this.summaryCache[key] as ZoomSummaryData | undefined;
@@ -478,6 +479,7 @@ export class SyncOrchestrator {
           const alreadyWritten = await writer.hasExistingSummary(vaultFile, parsedDate);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
+            alreadyInVault.add(instanceKey);
             continue;
           }
         }
@@ -524,7 +526,11 @@ export class SyncOrchestrator {
       }
       const summary = this.summaryCache[instanceKey] as ZoomSummaryData | undefined;
       if (!summary) {
-        results.push({ topic, status: "SKIP (no summary)" });
+        if (alreadyInVault.has(instanceKey)) {
+          results.push({ topic, status: "SKIP (already synced)" });
+        } else {
+          results.push({ topic, status: "SKIP (no summary)" });
+        }
         skipped++;
         continue;
       }
