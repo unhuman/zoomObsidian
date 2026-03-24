@@ -9,8 +9,8 @@
  * request — if still valid the BrowserWindow is skipped entirely.
  */
 
-import { Notice } from "obsidian";
 import type { SerializedCookie } from "./types";
+import { notify } from "./types";
 import { nodeRequest } from "./node-http";
 
 // Electron is externalized by esbuild — available at runtime in Obsidian desktop
@@ -75,26 +75,51 @@ export class ZoomAuth {
   /** Check whether stored cookies still grant access. */
   async isAuthenticated(): Promise<boolean> {
     if (!this.cookies.length) return false;
-    try {
-      const res = await nodeRequest(`${this.baseUrl}/user/meeting/summary`, {
-        method: "HEAD",
-        headers: { Cookie: this.getCookieHeader() },
-        followRedirects: false,
-      });
-      // Zoom redirects to /signin when unauthenticated
-      const loc = res.headers["location"] ?? "";
-      const ok =
-        res.status >= 200 &&
-        res.status < 400 &&
-        !loc.includes("/signin") &&
-        !loc.includes("/login") &&
-        !loc.includes("/sso");
-      this.dbg("isAuthenticated check:", res.status, ok);
-      return ok;
-    } catch (e) {
-      this.dbg("isAuthenticated error:", e);
-      return false;
+
+    // Try the HEAD check up to twice before giving up — transient network
+    // blips should not look like an expired session.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await nodeRequest(`${this.baseUrl}/user/meeting/summary`, {
+          method: "HEAD",
+          headers: { Cookie: this.getCookieHeader() },
+          followRedirects: false,
+        });
+        // Zoom redirects to /signin when unauthenticated
+        const loc = res.headers["location"] ?? "";
+        const isAuthRedirect =
+          loc.includes("/signin") ||
+          loc.includes("/login") ||
+          loc.includes("/sso");
+        // Treat server errors (5xx) as transient — don't conclude the session
+        // is invalid just because Zoom had a hiccup.
+        const isServerError = res.status >= 500;
+        const ok =
+          res.status >= 200 &&
+          res.status < 400 &&
+          !isAuthRedirect;
+        this.dbg(`isAuthenticated attempt ${attempt}:`, res.status, ok);
+
+        if (ok) return true;
+        if (isServerError && attempt < 2) {
+          this.dbg("Server error on attempt", attempt, "— retrying...");
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        this.dbg("Session invalid.");
+        return false;
+      } catch (e) {
+        this.dbg(`isAuthenticated error (attempt ${attempt}):`, e);
+        if (attempt < 2) {
+          this.dbg("Network error — retrying...");
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        this.dbg("Network error persists.");
+        return false;
+      }
     }
+    return false;
   }
 
   /**
@@ -167,7 +192,7 @@ export class ZoomAuth {
               }));
             this.cookies = zoomCookies;
             await this.persistCookies(zoomCookies);
-            new Notice("Zoom login successful — cookies saved.");
+            notify("Zoom login successful — cookies saved.");
             this.dbg("Saved", zoomCookies.length, "cookies");
             win.close();
             resolve();
@@ -192,6 +217,6 @@ export class ZoomAuth {
   async logout(): Promise<void> {
     this.cookies = [];
     await this.persistCookies([]);
-    new Notice("Zoom session cleared.");
+    notify("Zoom session cleared.");
   }
 }

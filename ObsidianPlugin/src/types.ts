@@ -3,6 +3,20 @@
  * Ported from the MCP server's zoom-summaries.ts and obsidian-client.ts.
  */
 
+import { Notice } from "obsidian";
+
+const LOG_PREFIX = "[zoom-obsidian]";
+const DEFAULT_NOTICE_DURATION = 8000; // ms
+
+/**
+ * Show an Obsidian Notice and mirror the message to the console.
+ * Use duration=0 for a persistent notice that must be hidden manually.
+ */
+export function notify(message: string, duration = DEFAULT_NOTICE_DURATION): Notice {
+  console.log(LOG_PREFIX, message);
+  return new Notice(message, duration);
+}
+
 /** A row from the Zoom meeting summaries list page. */
 export interface MeetingSummaryItem {
   meeting_topic: string;

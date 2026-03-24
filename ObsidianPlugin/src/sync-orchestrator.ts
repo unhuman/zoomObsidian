@@ -12,10 +12,10 @@
  *   7. Report results
  */
 
-import { Notice } from "obsidian";
 import type { ZoomClient } from "./zoom-client";
 import type { VaultWriter } from "./vault-writer";
 import type { MeetingSummaryItem, MeetingSummaryDetail, ZoomSummaryData } from "./types";
+import { notify } from "./types";
 
 export interface SyncPlanEntry {
   topic: string;
@@ -187,15 +187,16 @@ export class SyncOrchestrator {
     // Update scan timestamps.
     // Owned: no timestamp tracking — owned meetings can be deleted from Zoom
     // after writing, so a full scan each time is appropriate.
-    // Shared: advance only when autoDelete is on AND no topic filter is active.
-    // Uses the latest meeting date seen (not the run timestamp) so that
-    // meetings dated after the last-processed date are always picked up.
-    if (hasSharedFolder && autoDelete && !filter && latestSharedMeetingDate) {
+    // Shared: advance when no topic filter is active (filter would skip non-matching
+    // meetings that haven't been processed yet). autoDelete is irrelevant here —
+    // shared meetings are never deleted from Zoom regardless.
+    // Uses the latest meeting date seen (not the run timestamp) so that meetings
+    // dated after the last-processed date are always picked up.
+    if (hasSharedFolder && !filter && latestSharedMeetingDate) {
       report.updatedLastProcessedShared = latestSharedMeetingDate;
       this.dbg(`[scan-dates] Will advance lastProcessedShared → ${latestSharedMeetingDate} (latest meeting date)`);
     } else if (hasSharedFolder) {
       const reasons: string[] = [];
-      if (!autoDelete) reasons.push("autoDelete is off");
       if (filter) reasons.push("topic filter is active");
       if (!latestSharedMeetingDate) reasons.push("no shared meetings found");
       this.dbg(`[scan-dates] NOT advancing lastProcessedShared (${reasons.join(", ")})`);
@@ -207,7 +208,7 @@ export class SyncOrchestrator {
         ? `, ${totalDeleted} deleted, ${totalDeleteFailed} delete failures`
         : "");
     this.progress(summary);
-    new Notice(summary);
+    notify(summary);
 
     return report;
   }

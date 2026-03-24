@@ -9,7 +9,7 @@
  */
 
 import { Modal, Notice, Plugin, type App, TFolder } from "obsidian";
-import { DEFAULT_SETTINGS, DEFAULT_CONFIG_STATE, type ZoomObsidianSettings, type ObsidianConfigState } from "./types";
+import { DEFAULT_SETTINGS, DEFAULT_CONFIG_STATE, notify, type ZoomObsidianSettings, type ObsidianConfigState } from "./types";
 import { ZoomAuth } from "./zoom-auth";
 import { ZoomClient } from "./zoom-client";
 import { VaultWriter } from "./vault-writer";
@@ -149,30 +149,51 @@ export default class ZoomObsidianPlugin extends Plugin {
 
   // ── Commands ──────────────────────────────────────────────
 
+  /**
+   * Check authentication and, if the session is expired, automatically open
+   * the Zoom login window so the user can re-authenticate via SSO.
+   * Returns true if authenticated and ready to proceed.
+   */
+  private async ensureAuthenticated(): Promise<boolean> {
+    const checkNotice = notify("Checking Zoom authentication…", 0);
+    const authed = await this.auth.isAuthenticated();
+    checkNotice.hide();
+    if (authed) return true;
+
+    // Session expired — open the login window automatically
+    notify("Zoom session expired — opening login window…");
+    try {
+      await this.auth.login();
+    } catch (e) {
+      notify(`Zoom login failed: ${(e as Error).message}`);
+      return false;
+    }
+
+    // Verify the login succeeded (user may have closed the window)
+    const authedAfterLogin = await this.auth.isAuthenticated();
+    if (!authedAfterLogin) {
+      notify("Zoom login was not completed. Please try again.");
+    }
+    return authedAfterLogin;
+  }
+
   private async doLogin(): Promise<void> {
     try {
       await this.auth.login();
     } catch (e) {
-      new Notice(`Zoom login failed: ${(e as Error).message}`);
+      notify(`Zoom login failed: ${(e as Error).message}`);
     }
   }
 
   private async runSync(): Promise<void> {
-    // Check auth first
-    const authed = await this.auth.isAuthenticated();
-    if (!authed) {
-      new Notice(
-        "Not logged in to Zoom. Please log in first (Settings → Zoom Meeting Summaries, or run the Login to Zoom command)."
-      );
-      return;
-    }
+    if (!(await this.ensureAuthenticated())) return;
 
     // Validate shared meetings folder exists if specified
     if (this.settings.sharedMeetingsFolder?.trim()) {
       const folderPath = this.settings.sharedMeetingsFolder.trim();
       const folder = this.app.vault.getAbstractFileByPath(folderPath);
       if (!folder || !(folder instanceof TFolder)) {
-        new Notice(
+        notify(
           `Error: Shared Meetings folder does not exist: "${folderPath}". Please create it or update the setting.`
         );
         return;
@@ -195,7 +216,7 @@ export default class ZoomObsidianPlugin extends Plugin {
     let lastNotice: Notice | undefined;
     orchestrator.onProgress = (msg) => {
       lastNotice?.hide();
-      lastNotice = new Notice(msg, 0);
+      lastNotice = notify(msg, 0);
     };
 
     try {
@@ -219,11 +240,11 @@ export default class ZoomObsidianPlugin extends Plugin {
         msg.includes("session expired") ||
         msg.includes("log in")
       ) {
-        new Notice(
+        notify(
           "Zoom session expired. Please re-login via Settings or the Login to Zoom command."
         );
       } else {
-        new Notice(`Sync failed: ${msg}`);
+        notify(`Sync failed: ${msg}`);
       }
     } finally {
       this.client.closeScrapeWindow();
@@ -231,19 +252,15 @@ export default class ZoomObsidianPlugin extends Plugin {
   }
 
   private async showSummaryList(): Promise<void> {
-    const authed = await this.auth.isAuthenticated();
-    if (!authed) {
-      new Notice("Not logged in to Zoom. Please log in first.");
-      return;
-    }
+    if (!(await this.ensureAuthenticated())) return;
 
-    new Notice("Fetching Zoom summaries...", 0);
+    notify("Fetching Zoom summaries...", 0);
     try {
       const meetings = await this.client.listSummaries();
       new Notice("", 1); // dismiss
       new SummaryListModal(this.app, meetings).open();
     } catch (e) {
-      new Notice(`Failed to list summaries: ${(e as Error).message}`);
+      notify(`Failed to list summaries: ${(e as Error).message}`);
     } finally {
       this.client.closeScrapeWindow();
     }
