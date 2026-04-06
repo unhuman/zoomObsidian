@@ -127,7 +127,6 @@ export const DEFAULT_SETTINGS: ZoomObsidianSettings = {
 
 /** Per-source config file state (separate from data.json). */
 export interface ObsidianConfigState {
-  lastProcessedOwned?: string; // ISO timestamp
   lastProcessedShared?: string; // ISO timestamp
 }
 

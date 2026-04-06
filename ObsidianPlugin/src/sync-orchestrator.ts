@@ -185,8 +185,8 @@ export class SyncOrchestrator {
     };
 
     // Update scan timestamps.
-    // Owned: no timestamp tracking — owned meetings can be deleted from Zoom
-    // after writing, so a full scan each time is appropriate.
+    // Owned: no timestamp tracking — owned meetings are always fully scanned since
+    // they get deleted from Zoom after writing; incremental scanning would miss retries.
     // Shared: advance when no topic filter is active (filter would skip non-matching
     // meetings that haven't been processed yet). autoDelete is irrelevant here —
     // shared meetings are never deleted from Zoom regardless.
