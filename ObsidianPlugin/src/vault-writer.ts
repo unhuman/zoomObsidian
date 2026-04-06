@@ -169,6 +169,7 @@ export class VaultWriter {
    * Parse Zoom's startTime into "YYYY-MM-DD".
    */
   parseMeetingDate(startTime: string): string {
+    // ISO: 2026-03-31 or 2026-03-31T...
     const isoMatch = startTime.match(/(\d{4})-(\d{2})-(\d{2})/);
     if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
 
@@ -176,11 +177,19 @@ export class VaultWriter {
       jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
       jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12",
     };
-    const humanMatch = startTime.match(/(\w{3})\s+(\d{1,2}),\s+(\d{4})/i);
+
+    // "Mar 31, 2026" or "March 31, 2026"
+    const humanMatch = startTime.match(/([A-Za-z]{3,})\s+(\d{1,2}),\s+(\d{4})/);
     if (humanMatch) {
-      const month = months[humanMatch[1].toLowerCase()] ?? "01";
+      const month = months[humanMatch[1].toLowerCase().substring(0, 3)] ?? "01";
       const day = humanMatch[2].padStart(2, "0");
       return `${humanMatch[3]}-${month}-${day}`;
+    }
+
+    // MM/DD/YYYY or M/D/YYYY (Zoom web UI table format)
+    const slashMatch = startTime.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (slashMatch) {
+      return `${slashMatch[3]}-${slashMatch[1].padStart(2, "0")}-${slashMatch[2].padStart(2, "0")}`;
     }
 
     return new Date().toISOString().substring(0, 10);
@@ -318,24 +327,24 @@ export class VaultWriter {
       }
     };
 
-    // Idempotency: already written with content — skip
+    // Idempotency: already written with content — skip, unless this is a different meeting on the same day
     const headerRegex = new RegExp(
       `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`,
       "m"
     );
     const hasHeader = headerRegex.test(content) || this.dateBlockContains(content, dateStr, "Zoom AI Summary");
     if (hasHeader && !this.zoomBlockIsEmpty(content, dateStr)) {
-      return { inserted: false, position: "top", filePath: normalizedPath };
+      // If this exact meeting ID is already written, skip (idempotent re-sync)
+      // Otherwise fall through — hasSameDateZoom below will trigger ID-suffix insertion
+      const meetingId = String(summary.meeting_id ?? "");
+      if (!meetingId || content.includes(`(ID: ${meetingId})`)) {
+        return { inserted: false, position: "top", filePath: normalizedPath };
+      }
     }
 
-    // Strip bare header from previous bug
+    // Strip empty or placeholder block so real content can be inserted cleanly
     if (hasHeader && this.zoomBlockIsEmpty(content, dateStr)) {
-      content = content
-        .replace(
-          /^.*\d{4}-\d{2}-\d{2}.*Zoom AI Summary.*\n(\n)?/m,
-          ""
-        )
-        .trimStart();
+      content = this.stripZoomBlock(content, dateStr);
       if (!content.trim()) {
         const newSection = this.formatSummarySection(dateStr, summary, false);
         await writeContent(newSection);
@@ -454,16 +463,41 @@ export class VaultWriter {
     const lines = content.split("\n");
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].includes(`${dateStr} - Zoom AI Summary`)) {
+        const blockLines: string[] = [];
         for (let j = i + 1; j < lines.length; j++) {
           const next = lines[j];
-          if (next.trim() === "") continue;
-          if (next.startsWith("\t") || /^\s+\S/.test(next)) return false;
-          return true;
+          if (/^\d{4}-\d{2}-\d{2}/.test(next)) break;
+          if (next.trim()) blockLines.push(next.trim());
         }
-        return true;
+        if (blockLines.length === 0) return true;
+        // Treat a placeholder-only block as empty so real content can replace it
+        return blockLines.every((l) => l === "(No summary available)");
       }
     }
     return false;
+  }
+
+  /** Remove an entire Zoom summary block (header + body) for the given date. */
+  private stripZoomBlock(content: string, dateStr: string): string {
+    const lines = content.split("\n");
+    const blockStart = lines.findIndex((l) =>
+      l.includes(`${dateStr} - Zoom AI Summary`)
+    );
+    if (blockStart === -1) return content;
+
+    let blockEnd = lines.length;
+    for (let i = blockStart + 1; i < lines.length; i++) {
+      if (/^\d{4}-\d{2}-\d{2}/.test(lines[i])) {
+        blockEnd = i;
+        break;
+      }
+    }
+    // Consume trailing blank lines that belong to the block
+    while (blockEnd < lines.length && lines[blockEnd].trim() === "") blockEnd++;
+
+    return [...lines.slice(0, blockStart), ...lines.slice(blockEnd)]
+      .join("\n")
+      .trimStart();
   }
 
   /**

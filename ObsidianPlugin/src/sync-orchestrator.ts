@@ -147,7 +147,7 @@ export class SyncOrchestrator {
           (this.writer as any).app,
           {
             vaultSubfolder: "", // shared meetings are in the dedicated folder, not in vault subfolder
-            oneOnOneFolders: [this.sharedMeetingsFolder.trim()],
+            oneOnOneFolders: [this.sharedMeetingsFolder!.trim()],
           }
         );
         const sharedReport = await this.processMeetingSource(
@@ -360,9 +360,23 @@ export class SyncOrchestrator {
         .toString()
         .replace(/^Select /, "");
       const rawId = extractMeetingId(m);
-      // Owned table: topic(0)/date(1)/ID(2). Shared table: topic(0)/ID(1)/owner(2)/date(3).
-      const dateCol = sourceType === 'shared' ? 'column_3' : 'column_1';
-      const date = ((m as Record<string, unknown>)[dateCol] ?? "").toString().trim();
+      // Scan columns for whichever one contains a recognizable date string —
+      // the table layout varies (e.g. owned meetings have seen topic/topic/ID/email/date).
+      const datePatterns = [
+        /\d{4}-\d{2}-\d{2}/,
+        /[A-Za-z]{3,}\s+\d{1,2},\s+\d{4}/,
+        /\d{1,2}\/\d{1,2}\/\d{4}/,
+      ];
+      let date = "";
+      let dateCol = "(none)";
+      for (let ci = 0; ci <= 6; ci++) {
+        const val = ((m as Record<string, unknown>)[`column_${ci}`] ?? "").toString().trim();
+        if (val && datePatterns.some((p) => p.test(val))) {
+          date = val;
+          dateCol = `column_${ci}`;
+          break;
+        }
+      }
       const attendees = attendeesMap.get(rawId) ?? [];
       const parsedDate = writer.parseMeetingDate(date);
       const instanceKey = `${rawId}__${parsedDate}`;
@@ -475,8 +489,11 @@ export class SyncOrchestrator {
 
     for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate } of active) {
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
-        // Skip fetch if the vault file already has a summary for this date
-        if (vaultFile && parsedDate) {
+        // Skip fetch if the vault file already has a summary for this date.
+        // Only applies to shared meetings — owned meetings are deleted from Zoom after
+        // writing, so if one is still listed it hasn't been fully processed and must
+        // be fetched regardless of what's already in the vault.
+        if (sourceType === "shared" && vaultFile && parsedDate) {
           const alreadyWritten = await writer.hasExistingSummary(vaultFile, parsedDate);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
