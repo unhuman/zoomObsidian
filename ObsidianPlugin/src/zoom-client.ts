@@ -993,7 +993,7 @@ export class ZoomClient {
       `[getSummary] ${sourceType} ${meetingId} fields: ` +
         `overview=${Boolean((r.summaryOverview ?? r.overview ?? "").toString().trim())} ` +
         `sections=${Array.isArray(r.summaryItemVOs) ? r.summaryItemVOs.length : 0} ` +
-        `steps=${Array.isArray(r.stepList ?? r.nextStepList) ? (r.stepList ?? r.nextStepList as unknown[]).length : 0}`
+        `steps=${Array.isArray(r.stepList ?? r.nextStepList) ? ((r.stepList ?? r.nextStepList) as unknown[]).length : 0}`
     );
     return {
       meeting_id: meetingId,

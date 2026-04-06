@@ -489,11 +489,10 @@ export class SyncOrchestrator {
 
     for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate } of active) {
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
-        // Skip fetch if the vault file already has a summary for this date.
-        // Only applies to shared meetings — owned meetings are deleted from Zoom after
-        // writing, so if one is still listed it hasn't been fully processed and must
-        // be fetched regardless of what's already in the vault.
-        if (sourceType === "shared" && vaultFile && parsedDate) {
+        // Skip fetch if the vault file already has a non-placeholder summary for this date.
+        // Applies to all source types. For owned meetings, if auto-delete is on and the
+        // meeting is still in Zoom, Phase 5 will still attempt deletion via toDelete.
+        if (vaultFile && parsedDate) {
           const alreadyWritten = await writer.hasExistingSummary(vaultFile, parsedDate);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
@@ -538,16 +537,19 @@ export class SyncOrchestrator {
         latestMeetingDate = parsedDate;
       }
       if (!vaultFile || !rawId) {
-        results.push({ topic, status: "SKIP (no file)" });
+        results.push({ topic, status: `SKIP (no file) @ ${parsedDate}` });
         skipped++;
         continue;
       }
       const summary = this.summaryCache[instanceKey] as ZoomSummaryData | undefined;
       if (!summary) {
         if (alreadyInVault.has(instanceKey)) {
-          results.push({ topic, status: "SKIP (already synced)" });
+          results.push({ topic, status: `SKIP (already synced) @ ${parsedDate}` });
+          // Still queue for deletion — if auto-delete is on and the meeting is still
+          // in Zoom (e.g. a previous deletion failed), retry the delete now.
+          toDelete.push({ topic, rawId });
         } else {
-          results.push({ topic, status: "SKIP (no summary)" });
+          results.push({ topic, status: `SKIP (no summary) @ ${parsedDate}` });
         }
         skipped++;
         continue;
