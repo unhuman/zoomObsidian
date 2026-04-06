@@ -66,3 +66,23 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 ### Build
 
 `esbuild.config.mjs` compiles `src/main.ts` → `main.js` (CommonJS, externals: `obsidian`, `electron`, Node built-ins). Output files for installation: `main.js`, `manifest.json`, `styles.css`.
+
+### Versioning
+
+Version must be kept in sync across two files: `manifest.json` and `package.json`. Use semantic versioning (`MAJOR.MINOR.PATCH`):
+
+| Change type | Bump |
+|-------------|------|
+| Bug fix, incorrect behavior corrected | `PATCH` (1.1.0 → 1.1.1) |
+| New feature, new setting, new command | `MINOR` (1.1.0 → 1.2.0) |
+| Breaking change (incompatible settings, removed behavior) | `MAJOR` (1.1.0 → 2.0.0) |
+
+After any code change, update the version in both files before building:
+
+```json
+// manifest.json
+{ "version": "1.1.1" }
+
+// package.json
+{ "version": "1.1.1" }
+```
