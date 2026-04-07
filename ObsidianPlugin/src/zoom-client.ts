@@ -33,6 +33,8 @@ export class ZoomClient {
   private scrapeWin: InstanceType<typeof ElectronBrowserWindow> | null = null;
   /** Zoom account ID — used by the participants report API. Set via setAccountId(). */
   private _accountId: string = '';
+  /** Current user's Zoom display name — auto-detected from the first participants API response. */
+  private _detectedMyName: string = '';
 
   constructor(auth: ZoomAuth, opts?: { debug?: boolean }) {
     this.auth = auth;
@@ -46,6 +48,11 @@ export class ZoomClient {
   /** Set the Zoom account ID used by the participants report API. */
   setAccountId(id: string): void {
     this._accountId = id.trim();
+  }
+
+  /** Returns the current user's display name auto-detected from a participants API response, or empty string. */
+  getDetectedMyName(): string {
+    return this._detectedMyName;
   }
 
   private dbg(...args: unknown[]): void {
@@ -1328,9 +1335,19 @@ export class ZoomClient {
       return [];
     }
 
+    const meetingInfo = (result.result as any).meetingInfo ?? {};
+    const hostEmail = (meetingInfo.email ?? '').toLowerCase();
+    const hostName = (meetingInfo.hostName ?? '') as string;
+    if (hostName && !this._detectedMyName) {
+      this._detectedMyName = hostName;
+      this.dbg(`[getParticipants] Detected self display name: "${hostName}"`);
+    }
+
     const humans = result.result.list.filter(p => {
       const email = (p.email ?? '').toLowerCase();
-      return !email.startsWith('zoomroom_') && !p.roomDisplayName;
+      if (email.startsWith('zoomroom_') || p.roomDisplayName) return false; // Zoom Room devices
+      if (hostEmail && email === hostEmail) return false; // self (meeting host)
+      return true;
     });
 
     const names = humans.map(p => p.name ?? '').filter(Boolean);

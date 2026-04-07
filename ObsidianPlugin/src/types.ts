@@ -102,6 +102,8 @@ export interface ZoomObsidianSettings {
   cookies: SerializedCookie[];
   /** Filter string for meeting topics (optional). */
   filter: string;
+  /** Your Zoom display name, used to identify yourself in attendee lists. */
+  myDisplayName: string;
   /** Enable debug logging to console. */
   debug: boolean;
   /** Folder for shared Zoom meetings (optional). If not set, shared meetings are not processed. */
@@ -131,6 +133,7 @@ export const DEFAULT_SETTINGS: ZoomObsidianSettings = {
   autoDelete: false,
   cookies: [],
   filter: "",
+  myDisplayName: "",
   debug: false,
   sharedMeetingsFolder: "",
   zoomAccountId: "",

@@ -53,6 +53,8 @@ export class SyncOrchestrator {
   private writer: VaultWriter;
   private debug: boolean;
   private sharedMeetingsFolder?: string;
+  /** Lowercased first name of the current user, used to filter self from attendee lists. */
+  private selfFirstName: string;
 
   // In-memory caches (same pattern as the standalone script)
   private attendeesCache: Record<string, string[]> = {};
@@ -71,6 +73,7 @@ export class SyncOrchestrator {
       debug?: boolean;
       sharedMeetingsFolder?: string;
       lastProcessedShared?: string;
+      myDisplayName?: string;
     }
   ) {
     this.client = client;
@@ -78,6 +81,7 @@ export class SyncOrchestrator {
     this.debug = opts?.debug ?? false;
     this.sharedMeetingsFolder = opts?.sharedMeetingsFolder;
     this.lastProcessedShared = opts?.lastProcessedShared;
+    this.selfFirstName = (opts?.myDisplayName ?? "").split(/\s+/)[0].toLowerCase();
   }
 
   private dbg(...args: unknown[]): void {
@@ -419,19 +423,16 @@ export class SyncOrchestrator {
       }
 
       // Skip multi-person meetings
-      const otherAttendees = attendees.filter(
-        (n) => !n.toLowerCase().includes("howard") && !/\d/.test(n)
-      );
-      const topicNonHoward = topic
-        .split(":")
-        .map((s) => s.trim())
-        .filter(
-          (s) =>
-            s &&
-            /[a-zA-Z]{2,}/.test(s) &&
-            !s.toLowerCase().includes("howard")
-        );
-      if (otherAttendees.length > 1 || topicNonHoward.length > 1) {
+      // selfFirstName comes from settings; fall back to name auto-detected from participants API
+      const resolvedSelfFirst =
+        this.selfFirstName ||
+        (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
+      const isSelf = (n: string) =>
+        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
+      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
+      const topicParts = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s));
+      const topicNonSelf = topicParts.filter((s) => !isSelf(s));
+      if (otherAttendees.length > 1 || topicNonSelf.length > 1) {
         plan.push({
           topic,
           rawId,

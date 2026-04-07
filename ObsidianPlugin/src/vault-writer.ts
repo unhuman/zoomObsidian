@@ -78,7 +78,7 @@ export class VaultWriter {
   }
 
   /**
-   * Given a Zoom meeting topic like "Amit:Howard" or "Jeremy:Howard 1:1",
+   * Given a Zoom meeting topic like "Amit:Jane" or "Jeremy:Jane 1:1",
    * and optionally a list of attendee full names, find the best matching
    * .md file in the 1:1 folders.
    *
@@ -96,16 +96,14 @@ export class VaultWriter {
     const files = await this.allFiles();
     const norm = (s: string) => s.toLowerCase().trim();
 
-    const nonHowardAttendees = (attendeeNames ?? []).filter((n) => !/howard/i.test(n));
-
     // Priority 0: exact full attendee name matches file name
-    for (const fullName of nonHowardAttendees) {
+    for (const fullName of (attendeeNames ?? [])) {
       const match = files.find((f) => norm(f.name) === norm(fullName));
       if (match) return match.path;
     }
 
     // Build candidate first-names
-    const attendeeFirstNames = nonHowardAttendees
+    const attendeeFirstNames = (attendeeNames ?? [])
       .map((n) => n.split(/\s+/)[0])
       .filter(Boolean);
     const candidateFirstNames = [
@@ -147,7 +145,7 @@ export class VaultWriter {
       ? `${this.vaultSubfolder}/${newFilesFolder}`
       : newFilesFolder;
 
-    const best = (attendeeNames ?? []).find((n) => !/howard/i.test(n));
+    const best = (attendeeNames ?? [])[0];
     if (best) return normalizePath(`${base}/${best}.md`);
 
     const first = this.extractFirstName(meetingTopic);
