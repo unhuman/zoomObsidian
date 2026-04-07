@@ -381,6 +381,7 @@ export class SyncOrchestrator {
       const parsedDate = writer.parseMeetingDate(date);
       const instanceKey = `${rawId}__${parsedDate}`;
 
+      console.log(`[sync][phase3] topic="${topic}" rawId=${rawId} parsedDate=${parsedDate} instanceKey=${instanceKey}`);
       this.dbg(`[plan] topic="${topic}" rawId=${rawId} dateCol=${dateCol} rawDate="${date}" parsedDate=${parsedDate} instanceKey=${instanceKey} cols={c0=${(m as any).column_0?.toString().substring(0,30)}, c1=${(m as any).column_1?.toString().substring(0,30)}, c2=${(m as any).column_2?.toString().substring(0,30)}, c3=${(m as any).column_3?.toString().substring(0,30)}, c4=${(m as any).column_4}}`);
 
       if (!rawId) {
@@ -468,6 +469,9 @@ export class SyncOrchestrator {
       }
     }
 
+    for (const p of plan) {
+      console.log(`[sync][phase3-result] topic="${p.topic}" action=${p.action} vaultFile=${p.vaultFile} parsedDate=${p.parsedDate}`);
+    }
     const active = plan.filter((p) => p.action !== "skip");
     const inserts = active.filter((p) => p.action === "insert");
     const creates = active.filter((p) => p.action === "create");
@@ -489,6 +493,7 @@ export class SyncOrchestrator {
     };
 
     for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate } of active) {
+      console.log(`[sync][phase4] topic="${topic}" rawId=${rawId} instanceKey=${instanceKey} vaultFile=${vaultFile} parsedDate=${parsedDate} hasCached=${hasCachedContent(instanceKey)} inToFetch=${toFetchFull.has(instanceKey)}`);
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
         // Skip fetch if the vault file already has a non-placeholder summary for this date.
         // Applies to all source types. For owned meetings, if auto-delete is on and the

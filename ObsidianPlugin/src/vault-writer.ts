@@ -219,10 +219,11 @@ export class VaultWriter {
   private formatSummaryBody(
     summary: ZoomSummaryData,
     baseIndent: string,
-    includeLabel = true
+    includeLabel = true,
+    indentUnit = "\t"
   ): string {
-    const i1 = baseIndent + "\t";
-    const i2 = baseIndent + "\t\t";
+    const i1 = baseIndent + indentUnit;
+    const i2 = baseIndent + indentUnit + indentUnit;
     const lines: string[] = [];
 
     if (includeLabel) lines.push(`${baseIndent}Zoom AI Summary`);
@@ -382,7 +383,16 @@ export class VaultWriter {
       )
         trimEnd--;
 
-      const body = this.formatSummaryBody(summary, "\t");
+      // Detect the indentation unit used by the existing block so the inserted
+      // content matches the file's style (spaces vs. tabs, indent width).
+      let fileIndent = "\t";
+      for (let i = sameDateIdx + 1; i < blockEnd; i++) {
+        if (lines[i].trim() === "") continue;
+        const m = lines[i].match(/^(\s+)/);
+        if (m) fileIndent = m[1];
+        break;
+      }
+      const body = this.formatSummaryBody(summary, fileIndent, true, fileIndent);
       const before = lines.slice(0, trimEnd).join("\n");
       const after = lines.slice(blockEnd).join("\n");
       const newContent = before + "\n\n" + body + (after ? "\n" + after : "");
@@ -462,12 +472,15 @@ export class VaultWriter {
 
   private zoomBlockIsEmpty(content: string, dateStr: string): boolean {
     const lines = content.split("\n");
+    const dateRegex = /^\d{4}-\d{2}-\d{2}/;
+
+    // Case 1: standalone header "YYYY-MM-DD - Zoom AI Summary"
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].includes(`${dateStr} - Zoom AI Summary`)) {
         const blockLines: string[] = [];
         for (let j = i + 1; j < lines.length; j++) {
           const next = lines[j];
-          if (/^\d{4}-\d{2}-\d{2}/.test(next)) break;
+          if (dateRegex.test(next)) break;
           if (next.trim()) blockLines.push(next.trim());
         }
         if (blockLines.length === 0) return true;
@@ -475,30 +488,104 @@ export class VaultWriter {
         return blockLines.every((l) => l === "(No summary available)");
       }
     }
-    return false;
+
+    // Case 2: merged — "Zoom AI Summary" is nested inside an existing YYYY-MM-DD section.
+    // When the plugin previously merged a placeholder into a pre-existing dated section,
+    // the header is e.g. "2026-03-17 1:1 notes" (not "2026-03-17 - Zoom AI Summary"),
+    // so Case 1 never matches. Find the nested label and check its content.
+    let inDateBlock = false;
+    let labelIdx = -1;
+    let labelIndent = "";
+    for (let i = 0; i < lines.length; i++) {
+      if (!inDateBlock) {
+        if (lines[i].startsWith(dateStr) && dateRegex.test(lines[i])) inDateBlock = true;
+        continue;
+      }
+      if (dateRegex.test(lines[i])) break;
+      const trimmed = lines[i].trimStart();
+      if (trimmed === "Zoom AI Summary") {
+        labelIndent = lines[i].substring(0, lines[i].length - trimmed.length);
+        labelIdx = i;
+        break;
+      }
+    }
+    if (labelIdx === -1) {
+      console.log(`[vault][zoomBlockIsEmpty] Case2: no "Zoom AI Summary" label found in ${dateStr} block`);
+      return false;
+    }
+
+    const labelIndentLen = labelIndent.length;
+    const nestedLines: string[] = [];
+    for (let j = labelIdx + 1; j < lines.length; j++) {
+      const line = lines[j];
+      if (dateRegex.test(line)) break;
+      if (line.trim() === "") continue;
+      const lineIndentLen = (line.match(/^(\s*)/)?.[1] ?? "").length;
+      if (lineIndentLen <= labelIndentLen) break; // same or less indented = outside block
+      nestedLines.push(line.trim());
+    }
+    console.log(`[vault][zoomBlockIsEmpty] Case2: labelIdx=${labelIdx} labelIndentLen=${labelIndentLen} nestedLines=${JSON.stringify(nestedLines)}`);
+    if (nestedLines.length === 0) return true;
+    return nestedLines.every((l) => l === "(No summary available)");
   }
 
   /** Remove an entire Zoom summary block (header + body) for the given date. */
   private stripZoomBlock(content: string, dateStr: string): string {
     const lines = content.split("\n");
+    const dateRegex = /^\d{4}-\d{2}-\d{2}/;
+
+    // Case 1: standalone header "YYYY-MM-DD - Zoom AI Summary"
     const blockStart = lines.findIndex((l) =>
       l.includes(`${dateStr} - Zoom AI Summary`)
     );
-    if (blockStart === -1) return content;
+    if (blockStart !== -1) {
+      let blockEnd = lines.length;
+      for (let i = blockStart + 1; i < lines.length; i++) {
+        if (dateRegex.test(lines[i])) { blockEnd = i; break; }
+      }
+      // Consume trailing blank lines that belong to the block
+      while (blockEnd < lines.length && lines[blockEnd].trim() === "") blockEnd++;
+      return [...lines.slice(0, blockStart), ...lines.slice(blockEnd)]
+        .join("\n")
+        .trimStart();
+    }
 
-    let blockEnd = lines.length;
-    for (let i = blockStart + 1; i < lines.length; i++) {
-      if (/^\d{4}-\d{2}-\d{2}/.test(lines[i])) {
-        blockEnd = i;
+    // Case 2: merged — remove the nested "Zoom AI Summary" label + its content
+    // from inside the existing YYYY-MM-DD section, leaving the rest of that section intact.
+    let inDateBlock = false;
+    let labelIdx = -1;
+    let labelIndent = "";
+    for (let i = 0; i < lines.length; i++) {
+      if (!inDateBlock) {
+        if (lines[i].startsWith(dateStr) && dateRegex.test(lines[i])) inDateBlock = true;
+        continue;
+      }
+      if (dateRegex.test(lines[i])) break;
+      const trimmed = lines[i].trimStart();
+      if (trimmed === "Zoom AI Summary") {
+        labelIndent = lines[i].substring(0, lines[i].length - trimmed.length);
+        labelIdx = i;
         break;
       }
     }
-    // Consume trailing blank lines that belong to the block
-    while (blockEnd < lines.length && lines[blockEnd].trim() === "") blockEnd++;
+    if (labelIdx === -1) return content;
 
-    return [...lines.slice(0, blockStart), ...lines.slice(blockEnd)]
-      .join("\n")
-      .trimStart();
+    // The nested block ends at the first non-blank line at same or lower indentation,
+    // or at the next date line.
+    const labelIndentLen = labelIndent.length;
+    let blockEnd = labelIdx + 1;
+    while (blockEnd < lines.length) {
+      const line = lines[blockEnd];
+      if (dateRegex.test(line)) break;
+      if (line.trim() === "") { blockEnd++; continue; }
+      const lineIndentLen = (line.match(/^(\s*)/)?.[1] ?? "").length;
+      if (lineIndentLen <= labelIndentLen) break; // same/lower indent = outside block
+      blockEnd++;
+    }
+    // Trim trailing blank lines before blockEnd
+    while (blockEnd > labelIdx + 1 && lines[blockEnd - 1].trim() === "") blockEnd--;
+
+    return lines.filter((_, i) => i < labelIdx || i >= blockEnd).join("\n");
   }
 
   clearFileCache(): void {
@@ -529,7 +616,12 @@ export class VaultWriter {
       `^${dateStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} - Zoom AI Summary`,
       "m"
     );
-    const hasHeader = headerRegex.test(content) || this.dateBlockContains(content, dateStr, "Zoom AI Summary");
-    return hasHeader && !this.zoomBlockIsEmpty(content, dateStr);
+    const hasStandaloneHeader = headerRegex.test(content);
+    const hasMergedHeader = !hasStandaloneHeader && this.dateBlockContains(content, dateStr, "Zoom AI Summary");
+    const hasHeader = hasStandaloneHeader || hasMergedHeader;
+    const isEmpty = this.zoomBlockIsEmpty(content, dateStr);
+    const result = hasHeader && !isEmpty;
+    console.log(`[vault][hasExistingSummary] date=${dateStr} standalone=${hasStandaloneHeader} merged=${hasMergedHeader} isEmpty=${isEmpty} => ${result}`);
+    return result;
   }
 }
