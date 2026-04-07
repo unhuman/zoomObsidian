@@ -113,11 +113,214 @@ export class ZoomClient {
   }
 
   /**
+   * Open a VISIBLE BrowserWindow pointed at the meeting summary SPA and
+   * return a diagnostic report of what DOM structure is present.
+   *
+   * Use this when the scraping pipeline stops working — the report shows
+   * which selectors matched (or didn't), the hash-based route, and raw
+   * class names from the tables so you can update the selectors.
+   */
+  async diagnoseSpa(): Promise<string> {
+    const partition = "persist:zoom-obsidian";
+    const ses = electronSession.fromPartition(partition);
+
+    // Pre-load cookies
+    const cookies = this.auth.getSerializedCookies();
+    for (const c of cookies) {
+      try {
+        await ses.cookies.set({
+          url: `https://${c.domain.replace(/^\./, "")}${c.path}`,
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          secure: c.secure,
+          httpOnly: c.httpOnly,
+          expirationDate: c.expirationDate,
+        });
+      } catch { /* ignore */ }
+    }
+
+    const win = new ElectronBrowserWindow({
+      show: true,
+      width: 1280,
+      height: 900,
+      title: "Zoom SPA Diagnostics — Obsidian Plugin",
+      webPreferences: {
+        partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    });
+
+    const url = `${this.auth.baseUrl}/user/meeting/summary#/list`;
+    console.log("[zoom-client][diagnose] Loading:", url);
+    await win.loadURL(url);
+
+    // Wait up to 20s for ANYTHING to render
+    const start = Date.now();
+    while (Date.now() - start < 20000) {
+      const hasContent = await win.webContents.executeJavaScript(
+        `document.querySelectorAll('tbody tr, .zm-table__body-wrapper, [class*="table"], [class*="summary"], [class*="meeting"]').length > 0`
+      );
+      if (hasContent) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    // Give the SPA a bit more time to fully render
+    await new Promise((r) => setTimeout(r, 1000));
+
+    const report = await win.webContents.executeJavaScript(`
+      (function() {
+        var out = [];
+        var href = window.location.href;
+        var hash = window.location.hash;
+        out.push("=== URL ===");
+        out.push("href: " + href);
+        out.push("hash: " + hash);
+
+        out.push("\\n=== Known Selectors ===");
+        var selectors = [
+          '.zm-table__body-wrapper',
+          '.zm-table__body',
+          '.zm-table__body-wrapper tbody tr',
+          '.zm-table__body tbody tr',
+          'button.topic-link',
+          'a.topic-link',
+          '.zm-pager',
+          '.zm-pager li.number.active',
+          'button.btn-next',
+          'button.btn-prev',
+          '.zm-table__empty',
+          '.zm-empty-state',
+          '.empty-state',
+        ];
+        selectors.forEach(function(sel) {
+          var count = document.querySelectorAll(sel).length;
+          out.push((count > 0 ? "  ✓ " : "  ✗ ") + sel + " → " + count);
+        });
+
+        out.push("\\n=== All tables ===");
+        var tables = document.querySelectorAll('table');
+        out.push("table count: " + tables.length);
+        tables.forEach(function(t, i) {
+          var rows = t.querySelectorAll('tbody tr').length;
+          var cls = t.className || '(no class)';
+          var parentCls = (t.parentElement && t.parentElement.className) || '(no parent class)';
+          out.push("  table[" + i + "] class=" + cls + " parentClass=" + parentCls + " rows=" + rows);
+        });
+
+        out.push("\\n=== Elements with 'table' in class ===");
+        var tableEls = document.querySelectorAll('[class*="table"]');
+        var seen = new Set();
+        tableEls.forEach(function(el) {
+          var cls = el.className;
+          if (!seen.has(cls)) {
+            seen.add(cls);
+            var rows = el.querySelectorAll('tbody tr, tr').length;
+            out.push("  " + el.tagName.toLowerCase() + '.' + cls.split(' ').join('.') + " rows=" + rows);
+          }
+        });
+
+        out.push("\\n=== Elements with 'pager' or 'pagination' in class ===");
+        var pagerEls = document.querySelectorAll('[class*="pager"], [class*="pagination"]');
+        pagerEls.forEach(function(el) {
+          out.push("  " + el.tagName.toLowerCase() + '.' + el.className.split(' ').join('.'));
+        });
+
+        out.push("\\n=== Buttons with 'next', 'prev', 'delete', 'topic' in class/aria ===");
+        var btns = document.querySelectorAll('button, [role="button"]');
+        btns.forEach(function(btn) {
+          var cls = (btn.className || '').toLowerCase();
+          var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
+          var txt = (btn.textContent || '').trim().toLowerCase().substring(0, 40);
+          if (cls.includes('next') || cls.includes('prev') || cls.includes('topic') || cls.includes('delete') ||
+              lbl.includes('next') || lbl.includes('prev') || lbl.includes('delete') || lbl.includes('topic')) {
+            out.push("  button class=" + btn.className + " aria-label=" + btn.getAttribute('aria-label') + " text=" + txt);
+          }
+        });
+
+        out.push("\\n=== Body outer HTML (first 3000 chars) ===");
+        out.push((document.body.outerHTML || '').substring(0, 3000));
+
+        return out.join("\\n");
+      })()
+    `);
+
+    console.log("[zoom-client][diagnose]\n" + report);
+
+    // Phase 2: click the first topic button and capture the resulting URL
+    const clickReport = await win.webContents.executeJavaScript(`
+      (async function() {
+        var btn = document.querySelector('button.topic-link');
+        if (!btn) return "No topic-link button found";
+        var beforeHash = window.location.hash;
+        var beforeHref = window.location.href;
+        btn.click();
+        // Wait up to 8s for URL to change
+        var start = Date.now();
+        while (Date.now() - start < 8000) {
+          await new Promise(function(r) { setTimeout(r, 200); });
+          if (window.location.href !== beforeHref) break;
+        }
+        return JSON.stringify({
+          before: { href: beforeHref, hash: beforeHash },
+          after: { href: window.location.href, hash: window.location.hash },
+          hashStartsWithDetail: window.location.hash.startsWith('#/detail'),
+        });
+      })()
+    `);
+    console.log("[zoom-client][diagnose] Click test:", clickReport);
+
+    // Phase 3: if #/detail was reached, try the REST API
+    let apiReport = "(skipped — hash did not change to #/detail)";
+    try {
+      const clickData = JSON.parse(clickReport as string);
+      if (clickData.hashStartsWithDetail) {
+        const hash = clickData.after.hash as string;
+        const params = new URLSearchParams(hash.replace(/^#\/detail\??/, ""));
+        const meetingId = params.get("meetingId");
+        const summaryId = params.get("summaryId");
+        if (meetingId && summaryId) {
+          const apiUrl = `${this.auth.baseUrl}/rest/meeting/web_view_summary?meetingId=${encodeURIComponent(meetingId)}&summaryId=${encodeURIComponent(summaryId)}`;
+          const apiResult = await win.webContents.executeJavaScript(`
+            fetch(${JSON.stringify(apiUrl)}, { credentials: 'include', headers: { Accept: 'application/json' } })
+              .then(function(r) { return r.json(); })
+              .then(function(j) { return JSON.stringify({ status: j.status, resultKeys: j.result ? Object.keys(j.result) : null, raw: JSON.stringify(j).substring(0, 500) }); })
+              .catch(function(e) { return "fetch error: " + e.message; })
+          `);
+          apiReport = `meetingId=${meetingId} summaryId=${summaryId}\nAPI: ${apiResult}`;
+        } else {
+          apiReport = `Hash is #/detail but no meetingId/summaryId params: ${hash}`;
+        }
+      }
+    } catch (e) { apiReport = "parse error: " + (e as Error).message; }
+    console.log("[zoom-client][diagnose] API test:", apiReport);
+
+    const fullReport = report + "\n\n=== Click test ===\n" + clickReport + "\n\n=== API test ===\n" + apiReport;
+    // Leave the window open so the user can inspect it
+    return fullReport;
+  }
+
+  /**
    * Navigate the hidden window to a URL and wait for it to finish loading.
+   * If the target URL is the same as the currently loaded URL, Electron's
+   * loadURL() is a no-op (the page stays in whatever state it's in, e.g.
+   * stuck on page 2 after pagination). Force a hard reload in that case
+   * so the SPA resets to its initial state.
    */
   private async navigateScrapeWindow(url: string): Promise<void> {
     const win = await this.getOrCreateScrapeWindow();
-    await win.loadURL(url);
+    const currentUrl = win.webContents.getURL();
+    if (currentUrl === url) {
+      // Same URL — force a hard reload to reset SPA state
+      win.webContents.reload();
+      await new Promise<void>((resolve) => {
+        win.webContents.once("did-finish-load", resolve);
+      });
+    } else {
+      await win.loadURL(url);
+    }
   }
 
   /**
@@ -441,6 +644,7 @@ export class ZoomClient {
       !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
          document.querySelector('.zm-table__body tbody tr'))
     `, 15000);
+    console.log(`[zoom-client][resolveNavId] tableReady=${tableReady} id=${numericId} hash=${await this.execInWindow<string>(`window.location.hash`).catch(()=>'?')}`);
     if (!tableReady) return null;
 
     // Reset to page 1 — the SPA may still be on a later page from a prior scan
@@ -460,7 +664,7 @@ export class ZoomClient {
             var cells = rows[i].querySelectorAll('td');
             var idMatch = false;
             for (var j = 0; j < cells.length; j++) {
-              if ((cells[j].textContent || '').replace(/[\\s-]/g, '') === id) { idMatch = true; break; }
+              if ((cells[j].textContent || '').replace(/\\D/g, '') === id) { idMatch = true; break; }
             }
             if (idMatch) candidates.push(rows[i]);
           }
@@ -492,7 +696,7 @@ export class ZoomClient {
         })()
       `);
       const found = clickResult.found;
-      this.dbg(`[resolveNavId] id=${numericId} dateHint="${dateHint}" found=${found} candidates=${clickResult.candidateCount} matchedDate=${clickResult.matchedDate} clickedRow="${clickResult.clickedRowText}"`);
+      console.log(`[zoom-client][resolveNavId] id=${numericId} found=${found} candidates=${clickResult.candidateCount} clickedRow="${clickResult.clickedRowText.substring(0,60)}"`);
 
       if (found) {
         this.dbg(`[resolveNavId] Row found for ${numericId} (${sourceType}), waiting for #/detail...`);
@@ -521,8 +725,7 @@ export class ZoomClient {
           10000
         );
         const finalHash = await this.execInWindow<string>(`window.location.hash`);
-        const finalHref = await this.execInWindow<string>(`window.location.href`);
-        this.dbg(`[resolveNavId] After click: hashChanged=${hashChanged} hash="${finalHash}" href="${finalHref}"`);
+        console.log(`[zoom-client][resolveNavId] hashChanged=${hashChanged} finalHash="${finalHash.substring(0,80)}"`);
 
         if (hashChanged) {
           const entry = this.parseDetailHash(finalHash);
@@ -614,7 +817,7 @@ export class ZoomClient {
           for (var i = 0; i < rows.length; i++) {
             var cells = rows[i].querySelectorAll('td');
             for (var j = 0; j < cells.length; j++) {
-              var cellText = (cells[j].textContent || '').replace(/[\\s-]/g, '');
+              var cellText = (cells[j].textContent || '').replace(/\\D/g, '');
               if (ids.indexOf(cellText) !== -1) { found.push(cellText); break; }
             }
           }
@@ -636,7 +839,7 @@ export class ZoomClient {
               var cells = rows[i].querySelectorAll('td');
               var match = false;
               for (var j = 0; j < cells.length; j++) {
-                if ((cells[j].textContent || '').replace(/[\\s-]/g, '') === id) { match = true; break; }
+                if ((cells[j].textContent || '').replace(/\\D/g, '') === id) { match = true; break; }
               }
               if (match) {
                 var btn = rows[i].querySelector('button.topic-link');
@@ -1027,39 +1230,75 @@ export class ZoomClient {
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
     const cacheKey = this.navCacheKey(numericId, 'owned');
+    console.log(`[zoom-client][delete] START meetingId=${meetingId} numericId=${numericId} cacheHit=${this.navIdCache.has(cacheKey)}`);
 
     let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
       navEntry = (await this.resolveNavId(numericId, 'owned')) ?? undefined;
+      console.log(`[zoom-client][delete] resolveNavId result: ${navEntry ? `meetingId=${navEntry.uuidMeetingId}` : "null (not found)"}`);
       if (!navEntry) {
         return {
           success: true,
           message: `Meeting ${meetingId} not found (already deleted).`,
         };
       }
+    } else {
+      console.log(`[zoom-client][delete] Using cached navEntry: meetingId=${navEntry.uuidMeetingId}`);
     }
 
     const { uuidMeetingId, summaryId } = navEntry;
     const detailUrl = `${baseUrl}/user/meeting/summary#/detail?meetingId=${encodeURIComponent(uuidMeetingId)}&summaryId=${encodeURIComponent(summaryId)}`;
-    this.dbg(`[delete] Navigating to detail: ${detailUrl}`);
 
-    // Navigate to the detail page in the hidden BrowserWindow
-    await this.navigateScrapeWindow(detailUrl);
+    // If resolveNavId already navigated to this detail page via an in-page click,
+    // skip the loadURL() call — a cold reload is slower and less reliable than the
+    // in-page hash navigation that resolveNavId uses.
+    const currentHash = await this.execInWindow<string>(`window.location.hash`).catch(() => "");
+    const alreadyOnDetail = currentHash.startsWith("#/detail") && currentHash.includes(encodeURIComponent(uuidMeetingId));
+    console.log(`[zoom-client][delete] currentHash=${currentHash} alreadyOnDetail=${alreadyOnDetail}`);
+    if (!alreadyOnDetail) {
+      console.log(`[zoom-client][delete] Navigating to detail: ${detailUrl}`);
+      await this.navigateScrapeWindow(detailUrl);
+      await this.waitForCondition(`window.location.hash.startsWith("#/detail")`, 5000);
+    } else {
+      console.log(`[zoom-client][delete] Already on detail page, skipping reload`);
+    }
 
-    // Wait for the page to settle on the #/detail hash
-    await this.waitForCondition(
-      `window.location.hash.startsWith("#/detail")`,
-      5000
-    );
-
-    // Wait for the delete button to appear (confirms detail view rendered)
-    const deleteButtonReady = await this.waitForCondition(
-      `!!document.querySelector('button[aria-label="delete meeting summary"]')`,
-      8000
-    );
+    // Wait for the detail page to render with a delete button.
+    // Uses includes() not === to handle icon glyphs prepended to button text.
+    const deleteButtonCondition = `
+      (function() {
+        if (document.querySelector('button[aria-label="delete meeting summary"]')) return true;
+        if (document.querySelector('button[aria-label="Delete"]')) return true;
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+          var txt = (btns[i].textContent || '').trim().toLowerCase();
+          var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
+          if ((txt.includes('delete') && txt.length < 20) ||
+              lbl === 'delete' || lbl === 'delete meeting summary') return true;
+        }
+        return false;
+      })()
+    `;
+    const deleteButtonReady = await this.waitForCondition(deleteButtonCondition, 15000);
+    console.log(`[zoom-client][delete] deleteButtonReady=${deleteButtonReady}`);
 
     if (!deleteButtonReady) {
-      this.dbg(`[delete] Delete button not found — may already be deleted`);
+      // Dump all button texts to help diagnose UI changes
+      const btnDump = await this.execInWindow<string>(`
+        (function() {
+          var btns = document.querySelectorAll('button');
+          var out = [];
+          for (var i = 0; i < btns.length; i++) {
+            var txt = (btns[i].textContent || '').trim().substring(0, 40);
+            var lbl = btns[i].getAttribute('aria-label') || '';
+            out.push('btn[' + i + '] txt=' + JSON.stringify(txt) + ' lbl=' + JSON.stringify(lbl));
+          }
+          return out.join('\\n') || '(no buttons found)';
+        })()
+      `).catch(() => "(error dumping buttons)");
+      this.dbg(`[delete] Delete button not found. Page buttons:\n${btnDump}`);
+      this.dbg(`[delete] Current hash: `, await this.execInWindow<string>(`window.location.hash`).catch(() => "?"));
+
       // Maybe stale cache — evict and re-resolve
       this.navIdCache.delete(cacheKey);
       const retryNav = await this.resolveNavId(numericId, 'owned');
@@ -1072,14 +1311,11 @@ export class ZoomClient {
       // Navigate to the fresh detail URL
       const retryUrl = `${baseUrl}/user/meeting/summary#/detail?meetingId=${encodeURIComponent(retryNav.uuidMeetingId)}&summaryId=${encodeURIComponent(retryNav.summaryId)}`;
       await this.navigateScrapeWindow(retryUrl);
-      const retryReady = await this.waitForCondition(
-        `!!document.querySelector('button[aria-label="delete meeting summary"]')`,
-        8000
-      );
+      const retryReady = await this.waitForCondition(deleteButtonCondition, 15000);
       if (!retryReady) {
         return {
-          success: true,
-          message: `Delete button not found for meeting ${meetingId} (likely already deleted).`,
+          success: false,
+          message: `Delete button not found for meeting ${meetingId} — Zoom UI may have changed.`,
         };
       }
     }
@@ -1136,22 +1372,27 @@ export class ZoomClient {
       }
     }
 
-    // Wait for the "Move to Trash" confirmation dialog
+    // Wait for the "Move to Trash" confirmation dialog.
+    // Give the dialog time to animate in after the delete click.
+    await new Promise((r) => setTimeout(r, 600));
     const confirmReady = await this.waitForCondition(
-      `Array.from(document.querySelectorAll("button")).some(e => e.textContent?.trim().toLowerCase() === "move to trash")`,
-      3000
+      `Array.from(document.querySelectorAll("button")).some(function(e) {
+        var txt = (e.textContent || '').trim().toLowerCase();
+        return txt === "move to trash";
+      })`,
+      4000
     );
 
     let uiDeleteSucceeded = false;
 
     if (confirmReady) {
-      // Click "Move to Trash" confirmation
+      // Click "Move to Trash"
       const confirmed = await this.execInWindow<string | null>(`
         (() => {
           const allEls = Array.from(document.querySelectorAll("button, [role='button']"));
           const confirmEl = allEls.find(e => {
-            const txt = e.textContent?.trim().toLowerCase() ?? "";
-            return txt === "move to trash" || txt === "trash" || txt === "confirm" || txt === "yes" || txt === "ok";
+            const txt = (e.textContent || '').trim().toLowerCase();
+            return txt === "move to trash";
           });
           if (confirmEl) { confirmEl.click(); return confirmEl.textContent?.trim(); }
           return null;
@@ -1160,10 +1401,17 @@ export class ZoomClient {
       this.dbg(`[delete] Confirmation click: ${confirmed ?? "none"}`);
 
       if (confirmed) {
-        // Wait for the page to navigate away from detail (back to list) or for
-        // the delete button to disappear — either indicates success
+        // Wait for the page to navigate away from detail or for the delete button to disappear
         const deleted = await this.waitForCondition(
-          `!window.location.hash.startsWith("#/detail") || !document.querySelector('button[aria-label="delete meeting summary"]')`,
+          `!window.location.hash.startsWith("#/detail") || (function() {
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+              var txt = (btns[i].textContent || '').trim().toLowerCase();
+              var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
+              if (txt === 'delete' || lbl === 'delete' || lbl === 'delete meeting summary') return false;
+            }
+            return true;
+          })()`,
           8000
         );
         if (deleted) {
@@ -1172,7 +1420,7 @@ export class ZoomClient {
         }
       }
     } else {
-      this.dbg(`[delete] Move to Trash dialog not found — trying fallback`);
+      this.dbg(`[delete] Confirmation dialog not found — trying API fallback`);
     }
 
     if (uiDeleteSucceeded) {

@@ -477,6 +477,7 @@ export class SyncOrchestrator {
 
     // Phase 4: pre-fetch summaries
     this.progress("Fetching summaries...");
+    writer.clearFileCache();
     // Use instanceKey (rawId__date) to distinguish recurring meeting instances
     const toFetchFull = new Map<string, { rawId: string; topic: string; dateHint: string }>();
     const alreadyInVault = new Set<string>();

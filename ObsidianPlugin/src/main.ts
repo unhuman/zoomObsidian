@@ -71,6 +71,12 @@ export default class ZoomObsidianPlugin extends Plugin {
       callback: () => this.auth.logout(),
     });
 
+    this.addCommand({
+      id: "zoom-obsidian-diagnose",
+      name: "Diagnose Zoom SPA (opens browser window + logs to console)",
+      callback: () => this.runSpaDiagnosis(),
+    });
+
     // Ribbon icon
     this.addRibbonIcon("refresh-cw", "Sync Zoom summaries", () =>
       this.runSync()
@@ -251,6 +257,18 @@ export default class ZoomObsidianPlugin extends Plugin {
     }
   }
 
+  private async runSpaDiagnosis(): Promise<void> {
+    if (!(await this.ensureAuthenticated())) return;
+    notify("Opening Zoom SPA in browser window — check Obsidian console (Ctrl+Shift+I) for full report.", 8000);
+    try {
+      const report = await this.client.diagnoseSpa();
+      // Show a condensed version in a modal
+      new DiagnosticModal(this.app, report).open();
+    } catch (e) {
+      notify(`Diagnosis failed: ${(e as Error).message}`);
+    }
+  }
+
   private async showSummaryList(): Promise<void> {
     if (!(await this.ensureAuthenticated())) return;
 
@@ -316,6 +334,27 @@ class SyncReportModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
   }
+}
+
+class DiagnosticModal extends Modal {
+  private report: string;
+  constructor(app: App, report: string) {
+    super(app);
+    this.report = report;
+  }
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Zoom SPA Diagnostics" });
+    contentEl.createEl("p", { text: "Full report logged to Obsidian developer console (Ctrl+Shift+I / Cmd+Opt+I). Summary:" });
+    const lines = this.report.split("\n");
+    const selectorSection = lines.filter(l => l.includes("✓") || l.includes("✗") || l.startsWith("===") || l.startsWith("href:") || l.startsWith("hash:") || l.startsWith("table count:"));
+    const pre = contentEl.createEl("pre");
+    pre.style.cssText = "white-space:pre-wrap;font-size:11px;max-height:400px;overflow-y:auto;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;";
+    pre.textContent = selectorSection.join("\n");
+    const btn = contentEl.createEl("button", { text: "Close" });
+    btn.addEventListener("click", () => this.close());
+  }
+  onClose(): void { this.contentEl.empty(); }
 }
 
 class SummaryListModal extends Modal {

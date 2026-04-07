@@ -25,6 +25,7 @@ export class VaultWriter {
   private vaultSubfolder: string;
   private oneOnOneFolders: string[];
   private _fileCache: { name: string; path: string }[] | null = null;
+  private fileContentCache = new Map<string, string>();
 
   constructor(
     app: App,
@@ -500,21 +501,28 @@ export class VaultWriter {
       .trimStart();
   }
 
+  clearFileCache(): void {
+    this.fileContentCache.clear();
+  }
+
   /**
    * Check if a vault file already contains a non-empty Zoom AI Summary for the given date.
    * Used to skip expensive network fetches for meetings already written.
    */
   async hasExistingSummary(filePath: string, dateStr: string): Promise<boolean> {
     const normalizedPath = normalizePath(filePath);
-    let content: string;
+    let content: string | undefined = this.fileContentCache.get(normalizedPath);
 
-    const abstractFile = this.app.vault.getAbstractFileByPath(normalizedPath);
-    if (abstractFile instanceof TFile) {
-      content = await this.app.vault.read(abstractFile);
-    } else if (await this.app.vault.adapter.exists(normalizedPath)) {
-      content = await this.app.vault.adapter.read(normalizedPath);
-    } else {
-      return false;
+    if (content === undefined) {
+      const abstractFile = this.app.vault.getAbstractFileByPath(normalizedPath);
+      if (abstractFile instanceof TFile) {
+        content = await this.app.vault.read(abstractFile);
+      } else if (await this.app.vault.adapter.exists(normalizedPath)) {
+        content = await this.app.vault.adapter.read(normalizedPath);
+      } else {
+        return false;
+      }
+      this.fileContentCache.set(normalizedPath, content);
     }
 
     const headerRegex = new RegExp(
