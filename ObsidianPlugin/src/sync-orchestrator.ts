@@ -27,6 +27,8 @@ export interface SyncPlanEntry {
   instanceKey: string;
   vaultFile: string | null;
   action: "insert" | "create" | "skip";
+  /** When true, use the main 1:1 writer instead of the source-specific writer. */
+  useMainWriter?: boolean;
 }
 
 export interface SyncResult {
@@ -159,7 +161,8 @@ export class SyncOrchestrator {
           filter,
           false, // never auto-delete shared meetings (Zoom API limitation)
           sharedMeetingsWriter,
-          this.lastProcessedShared
+          this.lastProcessedShared,
+          this.writer  // mainWriter: enables routing shared 1:1s to person's 1:1 file
         );
         allResults.push(...sharedReport.results);
         totalWritten += sharedReport.written;
@@ -226,7 +229,8 @@ export class SyncOrchestrator {
     filter: string,
     autoDelete: boolean,
     writer: VaultWriter,
-    fromDate?: string
+    fromDate?: string,
+    mainWriter?: VaultWriter
   ): Promise<SyncReport> {
     const extractMeetingId = (m: MeetingSummaryItem): string => {
       const candidates = [
@@ -305,6 +309,10 @@ export class SyncOrchestrator {
       const rawId = extractMeetingId(m);
 
       if (sourceType === "shared") {
+        // Always fetch attendees for shared meetings so we can detect 1:1s.
+        if (rawId && !attendeesMap.has(rawId) && !toFetchAttendees.has(rawId)) {
+          toFetchAttendees.set(rawId, topic);
+        }
         continue;
       }
 
@@ -404,7 +412,31 @@ export class SyncOrchestrator {
         continue;
       }
 
+      // Compute self/other attendees — used for both owned and shared 1:1 detection.
+      const resolvedSelfFirst =
+        this.selfFirstName ||
+        (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
+      const isSelf = (n: string) =>
+        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
+      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
+      const topicParts = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s));
+      const topicNonSelf = topicParts.filter((s) => !isSelf(s));
+
       if (sourceType === "shared") {
+        // Route shared 1:1s to the person's 1:1 vault file when possible.
+        if (otherAttendees.length === 1 && mainWriter) {
+          const vaultFile1on1 = await mainWriter.findPersonFile(topic, otherAttendees);
+          if (vaultFile1on1) {
+            plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: vaultFile1on1, action: "insert", useMainWriter: true });
+            continue;
+          }
+          const suggested1on1 = mainWriter.suggestNewFilePath(topic, otherAttendees);
+          if (suggested1on1) {
+            plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: suggested1on1, action: "create", useMainWriter: true });
+            continue;
+          }
+        }
+        // Fall back to shared meetings folder.
         const sharedFolder = this.sharedMeetingsFolder?.trim() ?? "";
         const targetPath = `${sharedFolder}/${sanitizeFileStem(topic)}.md`;
         const existing = allFiles.find(
@@ -422,16 +454,7 @@ export class SyncOrchestrator {
         continue;
       }
 
-      // Skip multi-person meetings
-      // selfFirstName comes from settings; fall back to name auto-detected from participants API
-      const resolvedSelfFirst =
-        this.selfFirstName ||
-        (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
-      const isSelf = (n: string) =>
-        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
-      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
-      const topicParts = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s));
-      const topicNonSelf = topicParts.filter((s) => !isSelf(s));
+      // Skip multi-person owned meetings
       if (otherAttendees.length > 1 || topicNonSelf.length > 1) {
         plan.push({
           topic,
@@ -494,6 +517,7 @@ export class SyncOrchestrator {
     // Phase 4: pre-fetch summaries
     this.progress("Fetching summaries...");
     writer.clearFileCache();
+    mainWriter?.clearFileCache();
     // Use instanceKey (rawId__date) to distinguish recurring meeting instances
     const toFetchFull = new Map<string, { rawId: string; topic: string; dateHint: string }>();
     const alreadyInVault = new Set<string>();
@@ -504,14 +528,15 @@ export class SyncOrchestrator {
       return writer.hasSummaryContent(s);
     };
 
-    for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate } of active) {
+    for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate, useMainWriter: entryUsesMain } of active) {
       console.log(`[sync][phase4] topic="${topic}" rawId=${rawId} instanceKey=${instanceKey} vaultFile=${vaultFile} parsedDate=${parsedDate} hasCached=${hasCachedContent(instanceKey)} inToFetch=${toFetchFull.has(instanceKey)}`);
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
         // Skip fetch if the vault file already has a non-placeholder summary for this date.
         // Applies to all source types. For owned meetings, if auto-delete is on and the
         // meeting is still in Zoom, Phase 5 will still attempt deletion via toDelete.
         if (vaultFile && parsedDate) {
-          const alreadyWritten = await writer.hasExistingSummary(vaultFile, parsedDate);
+          const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
+          const alreadyWritten = await entryWriter.hasExistingSummary(vaultFile, parsedDate);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
             alreadyInVault.add(instanceKey);
@@ -549,7 +574,8 @@ export class SyncOrchestrator {
     const results: SyncResult[] = [];
     const toDelete: Array<{ topic: string; rawId: string }> = [];
 
-    for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action } of active) {
+    for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action, useMainWriter: entryUsesMain } of active) {
+      const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
       // Track latest meeting date for scan-date bookkeeping
       if (parsedDate && (!latestMeetingDate || parsedDate > latestMeetingDate)) {
         latestMeetingDate = parsedDate;
@@ -572,14 +598,14 @@ export class SyncOrchestrator {
         skipped++;
         continue;
       }
-      if (!writer.hasSummaryContent(summary)) {
+      if (!entryWriter.hasSummaryContent(summary)) {
         const errorDetail = (summary as Record<string, unknown>).error
           ? ` error=${String((summary as Record<string, unknown>).error)}`
           : "";
         this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — writing placeholder`);
       }
       try {
-        const r = await writer.insertSummary(vaultFile, parsedDate, summary);
+        const r = await entryWriter.insertSummary(vaultFile, parsedDate, summary);
         if (r.inserted) {
           written++;
           toDelete.push({ topic, rawId });
