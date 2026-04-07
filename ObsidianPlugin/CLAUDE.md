@@ -11,6 +11,8 @@ npm run build     # Production build (minified)
 
 No automated tests — testing is manual by loading the plugin in Obsidian.
 
+**Reloading the plugin after updating `main.js`:** Copying a new `main.js` alone is not sufficient. You must toggle the plugin off then on in Settings → Community Plugins. Using the "Refresh" button in settings updates the version number displayed but does not reload the running code.
+
 ## Architecture
 
 This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries into vault note files. Desktop-only because it requires Electron APIs (BrowserWindow, session partitions) for authentication and SPA scraping.
@@ -49,6 +51,12 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 7. **Report** results
 
 **Incremental sync:** Owned meetings are always fully scanned (they get deleted). Shared meetings use `lastProcessedShared` timestamp (stored in `obsidian-config.json`) for incremental scans.
+
+**Placeholder detection (vault-writer.ts):** When a meeting is synced before its AI summary is ready, the plugin writes `(No summary available)` as a placeholder. On the next sync, `zoomBlockIsEmpty()` detects this and allows the real content to overwrite it. There are two formats to handle:
+- **Standalone:** `YYYY-MM-DD - Zoom AI Summary` header with `(No summary available)` below (new file or no prior date entry).
+- **Merged:** `Zoom AI Summary` label nested inside an existing `YYYY-MM-DD` date section (most common for regular 1:1s). `zoomBlockIsEmpty()` detects this using indentation-depth comparison (not tab/space specific), and `stripZoomBlock()` removes the nested label + content before re-inserting with real data.
+
+**Indentation matching:** When merging content into an existing date section, the plugin detects the indentation style (tabs, 2-space, 4-space, etc.) from the first indented line in that block and uses it for the inserted Zoom AI Summary content.
 
 ### File Matching (vault-writer.ts)
 
