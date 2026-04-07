@@ -412,6 +412,31 @@ export class SyncOrchestrator {
         continue;
       }
 
+      // Group meeting: topic is 3+ colon-separated single-word names (e.g. "d:c:b").
+      // Sort alphabetically and route to a file named with the sorted parts (e.g. "b:c:d").
+      const topicPartsForGroup = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s) && !/\s/.test(s));
+      const isGroupTopic = topicPartsForGroup.length >= 3 && sourceType === "owned";
+      if (isGroupTopic) {
+        const sortedParts = [...topicPartsForGroup].sort((a, b) =>
+          a.toLowerCase().localeCompare(b.toLowerCase())
+        );
+        const groupFileName = sortedParts.join("-");
+        const existingGroup = allFiles.find(
+          (f) => f.name.toLowerCase() === groupFileName.toLowerCase()
+        );
+        if (existingGroup) {
+          plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: existingGroup.path, action: "insert" });
+        } else {
+          const suggestedGroup = writer.suggestNewFilePath(groupFileName, [groupFileName]);
+          plan.push({
+            topic, rawId, parsedDate, dateHint: date, instanceKey,
+            vaultFile: suggestedGroup,
+            action: suggestedGroup ? "create" : "skip",
+          });
+        }
+        continue;
+      }
+
       // Compute self/other attendees — used for both owned and shared 1:1 detection.
       const resolvedSelfFirst =
         this.selfFirstName ||
