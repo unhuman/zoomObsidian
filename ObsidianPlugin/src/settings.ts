@@ -154,6 +154,24 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Zoom account ID")
+      .setDesc(
+        'Required for participant lookup on adhoc "Zoom Meeting" 1:1s. ' +
+        'Find it in DevTools → Network while on Analytics & Reports → Meetings & Webinars: ' +
+        'click a participant count and inspect the POST body — the "accountId" value.'
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("VfmcPDweRYu1g6GgEEPq4g")
+          .setValue(this.plugin.settings.zoomAccountId)
+          .onChange(async (value) => {
+            this.plugin.settings.zoomAccountId = value.trim();
+            this.plugin.client.setAccountId(this.plugin.settings.zoomAccountId);
+            await this.plugin.saveSettings();
+          })
+      );
+
     // ── Debug ────────────────────────────────────────────────
 
     containerEl.createEl("h3", { text: "Advanced" });

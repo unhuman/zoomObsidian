@@ -31,6 +31,8 @@ export class ZoomClient {
   private navIdCache = new Map<string, NavIdEntry>();
   /** Hidden BrowserWindow used for SPA scraping. */
   private scrapeWin: InstanceType<typeof ElectronBrowserWindow> | null = null;
+  /** Zoom account ID — used by the participants report API. Set via setAccountId(). */
+  private _accountId: string = '';
 
   constructor(auth: ZoomAuth, opts?: { debug?: boolean }) {
     this.auth = auth;
@@ -39,6 +41,11 @@ export class ZoomClient {
 
   setDebug(debug: boolean): void {
     this.debug = debug;
+  }
+
+  /** Set the Zoom account ID used by the participants report API. */
+  setAccountId(id: string): void {
+    this._accountId = id.trim();
   }
 
   private dbg(...args: unknown[]): void {
@@ -1216,6 +1223,119 @@ export class ZoomClient {
       stepList: r.stepList as string[] | undefined,
       ...r,
     } as unknown as MeetingSummaryDetail;
+  }
+
+  // ─── Meeting Participants ─────────────────────────────────────
+
+  /**
+   * Fetch the participant list for a meeting from Zoom's reporting API.
+   * Falls back gracefully to [] if the navId isn't cached or the call fails.
+   *
+   * Filters out Zoom Room devices (email prefix "zoomroom_").
+   * Returns display names — callers are responsible for filtering out self.
+   */
+  async getMeetingParticipants(
+    meetingId: string,
+    sourceType: 'owned' | 'shared' = 'owned'
+  ): Promise<string[]> {
+    const numericId = meetingId.replace(/[\s-]/g, "");
+    const cacheKey = this.navCacheKey(numericId, sourceType);
+    let navEntry = this.navIdCache.get(cacheKey);
+    if (!navEntry) {
+      this.dbg(`[getParticipants] No cached navEntry for ${numericId}; resolving now`);
+      navEntry = (await this.resolveNavId(numericId, sourceType)) ?? undefined;
+      if (!navEntry) {
+        this.dbg(`[getParticipants] Could not resolve navId for ${numericId}`);
+        return [];
+      }
+    }
+
+    const uuidMeetingId = navEntry.uuidMeetingId;
+    const url = `${this.auth.baseUrl}/rest/account/report/historymeetings/participants/list`;
+    this.dbg(`[getParticipants] ${numericId} uuid=${uuidMeetingId}`);
+
+    const win = await this.getOrCreateScrapeWindow();
+    let raw: { accountId: string; storeKeys: string; body: unknown };
+    try {
+      raw = await win.webContents.executeJavaScript(`
+        (async function() {
+          // Extract accountId from the SPA's Vuex store — search all modules
+          let accountId = ${JSON.stringify(this._accountId ?? '')};
+          let storeKeys = '';
+          if (!accountId) {
+            try {
+              const state = document.querySelector('#app').__vue_app__.config.globalProperties.$store.state;
+              storeKeys = Object.keys(state).join(',');
+              for (const key of Object.keys(state)) {
+                const mod = state[key];
+                if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
+                  accountId = mod.accountId;
+                  break;
+                }
+              }
+              if (!accountId && typeof state.accountId === 'string') accountId = state.accountId;
+            } catch(e) {}
+            try {
+              if (!accountId) {
+                const state = document.querySelector('#app').__vue__.$store.state;
+                storeKeys = storeKeys || Object.keys(state).join(',');
+                for (const key of Object.keys(state)) {
+                  const mod = state[key];
+                  if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
+                    accountId = mod.accountId;
+                    break;
+                  }
+                }
+              }
+            } catch(e) {}
+            try {
+              if (!accountId) {
+                const candidates = ['zoomConfig','zoomInitData','ZM','__zm__','zoomData'];
+                for (const k of candidates) {
+                  if (window[k]?.accountId) { accountId = window[k].accountId; break; }
+                }
+              }
+            } catch(e) {}
+          }
+
+          const resp = await fetch(${JSON.stringify(url)}, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              accountId,
+              groupId: '',
+              isShowPersonal: true,
+              isShowUniqueAttendee: false,
+              meetingId: ${JSON.stringify(uuidMeetingId)},
+              page: 1,
+              scheduleForUserId: '',
+            }),
+          });
+          const body = await resp.json();
+          return { accountId, storeKeys, body };
+        })()
+      `);
+    } catch (e) {
+      this.dbg(`[getParticipants] Fetch error for ${numericId}: ${(e as Error).message}`);
+      return [];
+    }
+
+    const result = raw?.body as { status?: boolean; result?: { list?: Array<{ name?: string; email?: string; roomDisplayName?: string }> } } | undefined;
+    this.dbg(`[getParticipants] ${numericId} accountId="${raw?.accountId}" storeKeys="${raw?.storeKeys}" status=${result?.status} keys=${result?.result ? Object.keys(result.result).join(',') : 'none'} raw=${JSON.stringify(result).substring(0, 300)}`);
+
+    if (!result?.result?.list) {
+      this.dbg(`[getParticipants] No list in response for ${numericId}`);
+      return [];
+    }
+
+    const humans = result.result.list.filter(p => {
+      const email = (p.email ?? '').toLowerCase();
+      return !email.startsWith('zoomroom_') && !p.roomDisplayName;
+    });
+
+    const names = humans.map(p => p.name ?? '').filter(Boolean);
+    this.dbg(`[getParticipants] ${numericId}: ${names.join(', ')}`);
+    return names;
   }
 
   // ─── Delete Summary ───────────────────────────────────────────

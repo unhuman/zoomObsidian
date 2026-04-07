@@ -52,6 +52,8 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 
 **Incremental sync:** Owned meetings are always fully scanned (they get deleted). Shared meetings use `lastProcessedShared` timestamp (stored in `obsidian-config.json`) for incremental scans.
 
+**Adhoc "Zoom Meeting" 1:1 handling:** Owned meetings with topics matching `/^zoom\s+meeting\b/i` (e.g. "Zoom Meeting", "Zoom Meeting (1)") are treated as potential 1:1s. Phase 2 fetches attendees: first from `nextStepItems.assignees.username`, then falls back to `POST /rest/account/report/historymeetings/participants/list` (requires `zoomAccountId` in settings). Zoom Room devices (email prefix `zoomroom_`) are filtered out. If exactly one non-Howard attendee is identified, Phase 3 routes to `findPersonFile` / `suggestNewFilePath` exactly like named 1:1s.
+
 **Placeholder detection (vault-writer.ts):** When a meeting is synced before its AI summary is ready, the plugin writes `(No summary available)` as a placeholder. On the next sync, `zoomBlockIsEmpty()` detects this and allows the real content to overwrite it. There are two formats to handle:
 - **Standalone:** `YYYY-MM-DD - Zoom AI Summary` header with `(No summary available)` below (new file or no prior date entry).
 - **Merged:** `Zoom AI Summary` label nested inside an existing `YYYY-MM-DD` date section (most common for regular 1:1s). `zoomBlockIsEmpty()` detects this using indentation-depth comparison (not tab/space specific), and `stripZoomBlock()` removes the nested label + content before re-inserting with real data.

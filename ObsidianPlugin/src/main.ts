@@ -20,7 +20,7 @@ export default class ZoomObsidianPlugin extends Plugin {
   settings!: ZoomObsidianSettings;
   configState!: ObsidianConfigState;
   auth!: ZoomAuth;
-  private client!: ZoomClient;
+  client!: ZoomClient;
   private writer!: VaultWriter;
 
   async onload(): Promise<void> {
@@ -40,6 +40,7 @@ export default class ZoomObsidianPlugin extends Plugin {
     this.client = new ZoomClient(this.auth, {
       debug: this.settings.debug,
     });
+    if (this.settings.zoomAccountId) this.client.setAccountId(this.settings.zoomAccountId);
 
     this.writer = new VaultWriter(this.app, {
       vaultSubfolder: this.settings.vaultSubfolder,
@@ -206,6 +207,8 @@ export default class ZoomObsidianPlugin extends Plugin {
       }
     }
 
+    // Apply latest settings to client/writer
+    this.client.setAccountId(this.settings.zoomAccountId ?? "");
     // Rebuild writer in case settings changed
     this.writer = new VaultWriter(this.app, {
       vaultSubfolder: this.settings.vaultSubfolder,

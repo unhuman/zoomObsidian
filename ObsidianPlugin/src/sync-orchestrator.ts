@@ -309,7 +309,7 @@ export class SyncOrchestrator {
         (topic.includes(":") &&
           !topicFirst.includes(" ") &&
           topicFirst.toLowerCase() !== "zoom") ||
-        /^zoom meeting$/i.test(topic);
+        /^zoom\s+meeting\b/i.test(topic);
 
       if (
         !isCandidate ||
@@ -338,6 +338,17 @@ export class SyncOrchestrator {
             if (a.username && !names.includes(a.username)) names.push(a.username);
           }
         }
+        // Fallback: if nextStepItems gave no names, query the participant report API
+        if (names.length === 0) {
+          this.dbg(`[attendees] nextStepItems empty for ${rawId}; trying participant report API`);
+          try {
+            const participantNames = await this.client.getMeetingParticipants(rawId, sourceType);
+            names.push(...participantNames);
+          } catch (pe) {
+            this.dbg(`[attendees] participant API error for ${rawId}: ${(pe as Error).message}`);
+          }
+        }
+
         attendeesMap.set(rawId, names);
         this.attendeesCache[rawId] = names;
         if (!this.summaryCache[rawId]) this.summaryCache[rawId] = data;

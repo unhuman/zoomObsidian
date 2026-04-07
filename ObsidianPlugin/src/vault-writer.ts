@@ -96,10 +96,7 @@ export class VaultWriter {
     const files = await this.allFiles();
     const norm = (s: string) => s.toLowerCase().trim();
 
-    // Non-Howard attendees
-    const nonHowardAttendees = (attendeeNames ?? []).filter(
-      (n) => !/howard/i.test(n)
-    );
+    const nonHowardAttendees = (attendeeNames ?? []).filter((n) => !/howard/i.test(n));
 
     // Priority 0: exact full attendee name matches file name
     for (const fullName of nonHowardAttendees) {

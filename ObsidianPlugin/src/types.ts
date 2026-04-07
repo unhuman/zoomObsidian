@@ -106,6 +106,12 @@ export interface ZoomObsidianSettings {
   debug: boolean;
   /** Folder for shared Zoom meetings (optional). If not set, shared meetings are not processed. */
   sharedMeetingsFolder: string;
+  /**
+   * Zoom account ID for the participant report API.
+   * Found in DevTools → Network when clicking a participant count on the
+   * Analytics & Reports page. Value looks like "VfmcPDweRYu1g6GgEEPq4g".
+   */
+  zoomAccountId: string;
 }
 
 export interface SerializedCookie {
@@ -127,6 +133,7 @@ export const DEFAULT_SETTINGS: ZoomObsidianSettings = {
   filter: "",
   debug: false,
   sharedMeetingsFolder: "",
+  zoomAccountId: "",
 };
 
 /** Per-source config file state (separate from data.json). */
