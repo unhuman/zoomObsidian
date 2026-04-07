@@ -66,6 +66,23 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 3. File name starts with any attendee's first name
 4. File name contains first name as word boundary
 
+### Known Gotchas
+
+**Zoom portal is Cvent-branded:** The user's Zoom portal may present with Cvent branding, but the underlying SPA structure and selectors are standard Zoom. Don't let the branding differences confuse scraping logic.
+
+**Electron `loadURL` same-URL no-op (v1.1.7):** If `navigateScrapeWindow` is called with the same URL already loaded, Electron silently ignores the navigation. Fixed by detecting same-URL and forcing `webContents.reload()` + waiting for `did-finish-load`. This caused Phase 6 (delete) to silently fail when Phase 1 (list) left the window on page 2 with 0 rows.
+
+**Delete button aria-label varies:** The delete button on the detail page may use aria-label `"delete meeting summary"`, `"Delete"`, or just text `"Delete"`. Use broad matching (text includes `'delete'` + length < 20). Confirmation dialog button is `"Move to Trash"` — match only that, not `"delete"`, to avoid hitting the still-visible Delete button before the dialog appears.
+
+**`resolveNavId` cell matching:** Strip all non-digits (`/\D/g`) when comparing scraped cell text to meeting ID — not just spaces/hyphens.
+
+**`instanceKey` must include time (v1.1.16):** `instanceKey` is used as the dedup key for pre-fetch and summary cache. It was `rawId__parsedDate` (date only), which collided for recurring meetings with the same meeting ID occurring on the same day. Fixed to `rawId__date` where `date` is the raw `dateHint` string (includes time), falling back to `parsedDate`. Without this, only the first of multiple same-day instances of a recurring meeting is fetched.
+
+**Zoom API field caveats:**
+- `finalSummaryString` — pre-formatted full summary string used by some meeting types (demos, webinars). Check with `typeof x === "string"` before `.trim()`.
+- `boSummary` — may be boolean `false` (not a string). Always guard with `typeof x === "string"` before calling `.trim()` or treating as content.
+- `hasSummaryContent()` checks: `overallSummary`, `summaryOverview`, `summary_overview`, `summaryItemVOs`, `stepList`, `next_steps`, `finalSummaryString`, `boSummary`.
+
 ### Persistent State
 
 - `data.json` — User settings (subdomain, cookies, folder paths, filters)
