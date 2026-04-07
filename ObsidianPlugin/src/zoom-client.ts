@@ -1192,11 +1192,16 @@ export class ZoomClient {
     }
 
     const r = apiResponse.result;
+    const finalStr = typeof r.finalSummaryString === "string" ? r.finalSummaryString.trim() : "";
+    const boSummaryRaw = r.boSummary;
+    const boStr = typeof boSummaryRaw === "string" ? boSummaryRaw.trim() : "";
     this.dbg(
       `[getSummary] ${sourceType} ${meetingId} fields: ` +
         `overview=${Boolean((r.summaryOverview ?? r.overview ?? "").toString().trim())} ` +
         `sections=${Array.isArray(r.summaryItemVOs) ? r.summaryItemVOs.length : 0} ` +
-        `steps=${Array.isArray(r.stepList ?? r.nextStepList) ? ((r.stepList ?? r.nextStepList) as unknown[]).length : 0}`
+        `steps=${Array.isArray(r.stepList ?? r.nextStepList) ? ((r.stepList ?? r.nextStepList) as unknown[]).length : 0} ` +
+        `finalSummaryString(${finalStr.length})="${finalStr.substring(0, 80)}" ` +
+        `boSummary type=${typeof boSummaryRaw} val="${JSON.stringify(boSummaryRaw)?.substring(0, 80)}"`
     );
     return {
       meeting_id: meetingId,

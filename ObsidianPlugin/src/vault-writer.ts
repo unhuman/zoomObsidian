@@ -210,6 +210,8 @@ export class VaultWriter {
     if (sections && sections.length > 0) return true;
     const steps = (summary.stepList ?? summary.next_steps);
     if (steps && steps.length > 0) return true;
+    if (typeof summary.finalSummaryString === "string" && summary.finalSummaryString.trim()) return true;
+    if (typeof summary.boSummary === "string" && summary.boSummary.trim()) return true;
     return false;
   }
 
@@ -254,10 +256,21 @@ export class VaultWriter {
       for (const step of steps) lines.push(`${i2}- ${step.trim()}`);
     }
 
+    const finalStr = (typeof summary.finalSummaryString === "string" ? summary.finalSummaryString.trim() : "") ||
+                     (typeof summary.boSummary === "string" ? summary.boSummary.trim() : "");
+    if (finalStr) {
+      lines.push(i1);
+      for (const line of finalStr.split(/\n+/)) {
+        const trimmed = line.trim();
+        if (trimmed) lines.push(`${i1}${trimmed}`);
+      }
+    }
+
     if (
       !overall &&
       (!sections || sections.length === 0) &&
-      (!steps || steps.length === 0)
+      (!steps || steps.length === 0) &&
+      !finalStr
     ) {
       lines.push(`${i1}(No summary available)`);
     }

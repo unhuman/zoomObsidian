@@ -379,7 +379,7 @@ export class SyncOrchestrator {
       }
       const attendees = attendeesMap.get(rawId) ?? [];
       const parsedDate = writer.parseMeetingDate(date);
-      const instanceKey = `${rawId}__${parsedDate}`;
+      const instanceKey = `${rawId}__${date || parsedDate}`;
 
       console.log(`[sync][phase3] topic="${topic}" rawId=${rawId} parsedDate=${parsedDate} instanceKey=${instanceKey}`);
       this.dbg(`[plan] topic="${topic}" rawId=${rawId} dateCol=${dateCol} rawDate="${date}" parsedDate=${parsedDate} instanceKey=${instanceKey} cols={c0=${(m as any).column_0?.toString().substring(0,30)}, c1=${(m as any).column_1?.toString().substring(0,30)}, c2=${(m as any).column_2?.toString().substring(0,30)}, c3=${(m as any).column_3?.toString().substring(0,30)}, c4=${(m as any).column_4}}`);

@@ -76,6 +76,10 @@ export interface ZoomSummaryData {
   summaryItemVOs?: SummarySection[];
   stepList?: string[];
   next_steps?: string[];
+  /** Full summary as a pre-formatted string — returned by some meeting types (e.g. demos/webinars). */
+  finalSummaryString?: string;
+  /** Business overview summary — alternate content field used by some meeting types. */
+  boSummary?: string;
   topic?: string;
   startTime?: string;
   [key: string]: unknown;
