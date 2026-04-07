@@ -437,6 +437,15 @@ export class SyncOrchestrator {
         continue;
       }
 
+      // Exact topic match anywhere in vault — route to that file regardless of attendees.
+      if (sourceType === "owned") {
+        const exactMatch = await writer.findFileByExactName(topic);
+        if (exactMatch) {
+          plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: exactMatch, action: "insert" });
+          continue;
+        }
+      }
+
       // Compute self/other attendees — used for both owned and shared 1:1 detection.
       const resolvedSelfFirst =
         this.selfFirstName ||

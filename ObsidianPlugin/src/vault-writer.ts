@@ -153,6 +153,20 @@ export class VaultWriter {
     return normalizePath(`${base}/${first}.md`);
   }
 
+  /**
+   * Search the entire vault for a markdown file whose basename exactly matches
+   * the given name (case-insensitive). Returns the vault-relative path, or null.
+   */
+  async findFileByExactName(name: string): Promise<string | null> {
+    const normName = name.toLowerCase().trim();
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.basename.toLowerCase() === normName) {
+        return file.path;
+      }
+    }
+    return null;
+  }
+
   private extractFirstName(topic: string): string | null {
     const colonIdx = topic.indexOf(":");
     if (colonIdx <= 0) return null;
