@@ -453,8 +453,10 @@ export class SyncOrchestrator {
       const isSelf = (n: string) =>
         resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
       const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
-      const topicParts = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s));
-      const topicNonSelf = topicParts.filter((s) => !isSelf(s));
+      // Use single-word colon parts only for the multi-person topic check.
+      // Multi-word parts like "Howard (alternate)" are parenthetical suffixes, not
+      // additional people — so they must not inflate topicNonSelf and trigger a skip.
+      const topicNonSelf = topicPartsForGroup.filter((s) => !isSelf(s));
 
       if (sourceType === "shared") {
         // Route shared 1:1s to the person's 1:1 vault file when possible.
@@ -488,8 +490,14 @@ export class SyncOrchestrator {
         continue;
       }
 
-      // Skip multi-person owned meetings
-      if (otherAttendees.length > 1 || topicNonSelf.length > 1) {
+      // Skip multi-person owned meetings.
+      // When self identity is unknown (no myDisplayName set and name not yet auto-detected),
+      // isSelf() returns false for everyone — including the user — so otherAttendees
+      // can't be used reliably. Fall back to topic structure only in that case.
+      const isMultiPerson = resolvedSelfFirst
+        ? otherAttendees.length > 1 || topicNonSelf.length > 1
+        : topicNonSelf.length > 1;
+      if (isMultiPerson) {
         plan.push({
           topic,
           rawId,

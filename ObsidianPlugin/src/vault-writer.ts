@@ -149,8 +149,13 @@ export class VaultWriter {
     if (best) return normalizePath(`${base}/${best}.md`);
 
     const first = this.extractFirstName(meetingTopic);
-    if (!first) return null;
-    return normalizePath(`${base}/${first}.md`);
+    if (first) return normalizePath(`${base}/${first}.md`);
+
+    // No colon pattern: use the sanitized topic itself as the filename so that
+    // plain-named meetings like "Shared Services Managers Meeting" get a target file.
+    const sanitized = this.sanitizeFilename(meetingTopic);
+    if (!sanitized) return null;
+    return normalizePath(`${base}/${sanitized}.md`);
   }
 
   /**

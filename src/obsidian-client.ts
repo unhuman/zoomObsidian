@@ -155,7 +155,13 @@ export class ObsidianClient {
     if (best) return path.join(newFilesDir, `${best}.md`);
 
     const first = this.extractFirstName(meetingTopic);
-    if (!first) return null; // group meeting with no colon pattern — skip
+    if (!first) {
+      // No colon pattern: use the sanitized topic itself as the filename so that
+      // plain-named meetings like "Shared Services Managers Meeting" get a target file.
+      const sanitized = this.sanitizeFilename(meetingTopic);
+      if (!sanitized) return null;
+      return path.join(newFilesDir, `${sanitized}.md`);
+    }
     return path.join(newFilesDir, `${first}.md`);
   }
 
@@ -163,7 +169,7 @@ export class ObsidianClient {
     // "Amit:Howard" → "Amit"
     // "Jeremy:Howard 1:1" → "Jeremy"
     // "Zoom Meeting" → null
-    // "Shared Services Managers Meeting" → null
+    // "Shared Services Managers Meeting" → null (caller falls back to sanitized topic)
     const colonIdx = topic.indexOf(":");
     if (colonIdx <= 0) return null;
     const firstName = topic.substring(0, colonIdx).trim();
