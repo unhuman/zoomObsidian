@@ -647,6 +647,8 @@ export class SyncOrchestrator {
         this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — skipping write until data is ready`);
         skipped++;
         results.push({ topic, status: `PENDING @ ${parsedDate}` });
+        // CRITICAL: Do NOT add to toDelete — pending meetings are retried on next sync when data is ready.
+        // Deleting now would lose the meeting without capturing its summary.
         continue;
       }
       try {
