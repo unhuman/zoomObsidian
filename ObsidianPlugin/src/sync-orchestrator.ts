@@ -578,7 +578,7 @@ export class SyncOrchestrator {
         // meeting is still in Zoom, Phase 5 will still attempt deletion via toDelete.
         if (vaultFile && parsedDate) {
           const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
-          const alreadyWritten = await entryWriter.hasExistingSummary(vaultFile, parsedDate);
+          const alreadyWritten = await entryWriter.hasExistingSummary(vaultFile, parsedDate, rawId);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
             alreadyInVault.add(instanceKey);

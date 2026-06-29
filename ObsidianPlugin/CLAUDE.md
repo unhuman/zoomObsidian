@@ -96,15 +96,23 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 
 ### Versioning
 
+**CRITICAL: Update version in BOTH files BEFORE building and committing.**
+
 Version must be kept in sync across two files: `manifest.json` and `package.json`. Use semantic versioning (`MAJOR.MINOR.PATCH`):
 
-| Change type | Bump |
-|-------------|------|
-| Bug fix, incorrect behavior corrected | `PATCH` (1.1.0 → 1.1.1) |
-| New feature, new setting, new command | `MINOR` (1.1.0 → 1.2.0) |
-| Breaking change (incompatible settings, removed behavior) | `MAJOR` (1.1.0 → 2.0.0) |
+| Change type | Bump | Example |
+|-------------|------|---------|
+| Bug fix, incorrect behavior corrected | `PATCH` | 1.2.5 → 1.2.6 |
+| New feature, new setting, new command | `MINOR` | 1.2.5 → 1.3.0 |
+| Breaking change (incompatible settings, removed behavior) | `MAJOR` | 1.2.5 → 2.0.0 |
 
-After any code change, update the version in both files before building:
+**Process:**
+1. Identify the change type (bug fix, new feature, or breaking change)
+2. Increment the appropriate version component in BOTH `manifest.json` and `package.json`
+3. Build (`npm run build`)
+4. Commit with the version bump included
+
+Example:
 
 ```json
 // manifest.json

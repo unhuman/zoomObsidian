@@ -623,7 +623,7 @@ export class VaultWriter {
    * Check if a vault file already contains a non-empty Zoom AI Summary for the given date.
    * Used to skip expensive network fetches for meetings already written.
    */
-  async hasExistingSummary(filePath: string, dateStr: string): Promise<boolean> {
+  async hasExistingSummary(filePath: string, dateStr: string, rawId?: string): Promise<boolean> {
     const normalizedPath = normalizePath(filePath);
     let content: string | undefined = this.fileContentCache.get(normalizedPath);
 
@@ -647,8 +647,12 @@ export class VaultWriter {
     const hasMergedHeader = !hasStandaloneHeader && this.dateBlockContains(content, dateStr, "Zoom AI Summary");
     const hasHeader = hasStandaloneHeader || hasMergedHeader;
     const isEmpty = this.zoomBlockIsEmpty(content, dateStr);
-    const result = hasHeader && !isEmpty;
-    console.log(`[vault][hasExistingSummary] date=${dateStr} standalone=${hasStandaloneHeader} merged=${hasMergedHeader} isEmpty=${isEmpty} => ${result}`);
+
+    // If rawId is provided, also require the ID marker — ensures this specific meeting instance
+    // was actually synced by the plugin, not just hand-typed notes with the same date header.
+    const hasIdMarker = !rawId || content.includes(`(ID: ${rawId})`);
+    const result = hasHeader && !isEmpty && hasIdMarker;
+    console.log(`[vault][hasExistingSummary] date=${dateStr} rawId=${rawId} standalone=${hasStandaloneHeader} merged=${hasMergedHeader} isEmpty=${isEmpty} hasIdMarker=${hasIdMarker} => ${result}`);
     return result;
   }
 }
