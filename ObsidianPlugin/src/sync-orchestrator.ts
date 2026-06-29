@@ -646,7 +646,7 @@ export class SyncOrchestrator {
           : "";
         this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — skipping write until data is ready`);
         skipped++;
-        results.push({ topic, status: `⏸ pending summary @ ${parsedDate}` });
+        results.push({ topic, status: `PENDING @ ${parsedDate}` });
         continue;
       }
       try {
