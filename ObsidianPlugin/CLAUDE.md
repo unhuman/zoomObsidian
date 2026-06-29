@@ -11,7 +11,22 @@ npm run build     # Production build (minified)
 
 No automated tests — testing is manual by loading the plugin in Obsidian.
 
-**Reloading the plugin after updating `main.js`:** Copying a new `main.js` alone is not sufficient. You must toggle the plugin off then on in Settings → Community Plugins. Using the "Refresh" button in settings updates the version number displayed but does not reload the running code.
+## Deployment
+
+After code changes:
+
+1. **Update version** in BOTH `manifest.json` and `package.json` (see [Versioning](#versioning) section)
+2. **Build:** `npm run build`
+3. **Copy all three files** to the vault plugin directory:
+   ```bash
+   cp ObsidianPlugin/main.js ObsidianPlugin/manifest.json ObsidianPlugin/styles.css \
+     /path/to/vault/.obsidian/plugins/zoom-obsidian/
+   ```
+   (All three files must be in sync: `main.js`, `manifest.json`, `styles.css`)
+4. **Reload in Obsidian:** Settings → Community Plugins → zoom-obsidian → toggle OFF, wait 2 seconds, toggle ON
+5. **Verify:** Check the version number in Community Plugins settings matches the new version
+
+**Important:** Simply copying `main.js` is insufficient. The manifest and styles must also be kept in sync. Using the "Refresh" button in settings updates the displayed version but does NOT reload the running code — you must toggle the plugin off then on.
 
 ## Architecture
 
