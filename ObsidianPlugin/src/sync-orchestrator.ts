@@ -644,7 +644,10 @@ export class SyncOrchestrator {
         const errorDetail = (summary as Record<string, unknown>).error
           ? ` error=${String((summary as Record<string, unknown>).error)}`
           : "";
-        this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — writing placeholder`);
+        this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — skipping write until data is ready`);
+        skipped++;
+        results.push({ topic, status: `⏸ pending summary @ ${parsedDate}` });
+        continue;
       }
       try {
         const r = await entryWriter.insertSummary(vaultFile, parsedDate, summary);
