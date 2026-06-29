@@ -61,7 +61,34 @@ If you use the [BRAT](https://github.com/TfTHacker/obsidian42-brat) plugin for b
 
 ### Updating
 
-After pulling new code and rebuilding, copy `main.js`, `manifest.json`, and `styles.css` to your vault's plugin directory again and reload Obsidian.
+After making code changes:
+
+1. **Update version** in BOTH files (use semantic versioning):
+   - `manifest.json` — change `"version"`
+   - `package.json` — change `"version"`
+   - **Bump rules:** Bug fix = PATCH (1.2.5 → 1.2.6), New feature = MINOR (1.2.5 → 1.3.0), Breaking change = MAJOR (1.2.5 → 2.0.0)
+
+2. **Rebuild the plugin:**
+   ```bash
+   npm run build
+   ```
+
+3. **Copy ALL THREE files** to your vault's plugin directory:
+   ```bash
+   cp ObsidianPlugin/main.js ObsidianPlugin/manifest.json ObsidianPlugin/styles.css \
+     /path/to/your/vault/.obsidian/plugins/zoom-obsidian/
+   ```
+   ⚠️ **Important:** All three files (`main.js`, `manifest.json`, `styles.css`) must be copied together. Simply copying `main.js` alone is insufficient.
+
+4. **Reload the plugin in Obsidian:**
+   - Go to **Settings → Community Plugins → Zoom Meeting Summaries**
+   - Toggle the plugin **OFF**
+   - Wait 2 seconds
+   - Toggle the plugin **ON**
+   - ⚠️ Using the "Refresh" button only updates the displayed version number—it does NOT reload the running code. You must toggle off/on.
+
+5. **Verify the update:**
+   - In **Community Plugins**, confirm the version number matches your new version
 
 ## Configuration
 
