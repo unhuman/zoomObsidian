@@ -45,6 +45,7 @@ export default class ZoomObsidianPlugin extends Plugin {
     this.writer = new VaultWriter(this.app, {
       vaultSubfolder: this.settings.vaultSubfolder,
       oneOnOneFolders: this.parseOneFolders(),
+      myDisplayName: this.settings.myDisplayName || undefined,
     });
 
     // Register commands
@@ -213,6 +214,7 @@ export default class ZoomObsidianPlugin extends Plugin {
     this.writer = new VaultWriter(this.app, {
       vaultSubfolder: this.settings.vaultSubfolder,
       oneOnOneFolders: this.parseOneFolders(),
+      myDisplayName: this.settings.myDisplayName || undefined,
     });
 
     const orchestrator = new SyncOrchestrator(this.client, this.writer, {

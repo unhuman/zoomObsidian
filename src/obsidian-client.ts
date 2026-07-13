@@ -31,6 +31,8 @@ export interface ObsidianClientOptions {
   vaultSubfolder?: string;
   /** Folder names (relative to vaultSubfolder) that contain 1:1 notes. */
   oneOnOneFolders?: string[];
+  /** Owner's Zoom display name (first name or full name). Used to filter self from attendee lists and resolve topic names. */
+  ownerName?: string;
 }
 
 export class ObsidianClient {
@@ -38,11 +40,23 @@ export class ObsidianClient {
   private vaultSubfolder: string;
   private oneOnOneFolders: string[];
   private _fileCache: { name: string; path: string }[] | null = null;
+  private ownerName: string;
+  private ownerFirst: string;
 
   constructor(vaultPath: string, options: ObsidianClientOptions = {}) {
     this.vaultPath = vaultPath.replace(/^~/, process.env.HOME ?? "~");
     this.vaultSubfolder = options.vaultSubfolder ?? "";
     this.oneOnOneFolders = options.oneOnOneFolders ?? DEFAULT_ONE_ON_ONE_FOLDERS;
+    this.ownerName = options.ownerName ?? "";
+    this.ownerFirst = this.ownerName.split(/\s+/)[0].toLowerCase();
+  }
+
+  /**
+   * Check if a name is the owner (by checking first word).
+   */
+  private isSelf(name: string): boolean {
+    if (!this.ownerFirst) return name.toLowerCase().includes("howard"); // legacy fallback
+    return name.toLowerCase().includes(this.ownerFirst);
   }
 
   /**
@@ -89,30 +103,30 @@ export class ObsidianClient {
     meetingTopic: string,
     attendeeNames?: string[]
   ): Promise<string | null> {
-    const topicFirst = this.extractFirstName(meetingTopic);
+    const topicPartner = this.extractPartnerName(meetingTopic);
     const files = await this.allFiles();
 
     const norm = (s: string) => s.toLowerCase().trim();
 
-    // Non-Howard attendees (full names)
-    const nonHowardAttendees = (attendeeNames ?? []).filter(
-      (n) => !/howard/i.test(n)
+    // Non-owner attendees (full names)
+    const nonOwnerAttendees = (attendeeNames ?? []).filter(
+      (n) => !this.isSelf(n)
     );
 
     // Priority 0: exact full attendee name matches file name
-    for (const fullName of nonHowardAttendees) {
+    for (const fullName of nonOwnerAttendees) {
       const match = files.find((f) => norm(f.name) === norm(fullName));
       if (match) return match.path;
     }
 
     // Build candidate first-names from attendees, excluding self
-    const attendeeFirstNames: string[] = nonHowardAttendees
+    const attendeeFirstNames: string[] = nonOwnerAttendees
       .map((n) => n.split(/\s+/)[0])
       .filter(Boolean);
 
-    // Also include the topic first name as a candidate
+    // Also include the topic partner name as a candidate (if not self)
     const candidateFirstNames = [
-      ...(topicFirst ? [topicFirst] : []),
+      ...(topicPartner ? [topicPartner] : []),
       ...attendeeFirstNames,
     ].filter(Boolean);
 
@@ -148,34 +162,41 @@ export class ObsidianClient {
     const newFilesFolder = this.oneOnOneFolders[1] ?? this.oneOnOneFolders[0] ?? "! One on Ones (Other)";
     const newFilesDir = path.join(baseDir, newFilesFolder);
 
-    // Prefer the first non-Howard attendee full name
+    // Prefer the first non-owner attendee full name
     const best = (attendeeNames ?? []).find(
-      (n) => !/howard/i.test(n)
+      (n) => !this.isSelf(n)
     );
     if (best) return path.join(newFilesDir, `${best}.md`);
 
-    const first = this.extractFirstName(meetingTopic);
-    if (!first) {
+    const partner = this.extractPartnerName(meetingTopic);
+    if (!partner) {
       // No colon pattern: use the sanitized topic itself as the filename so that
       // plain-named meetings like "Shared Services Managers Meeting" get a target file.
       const sanitized = this.sanitizeFilename(meetingTopic);
       if (!sanitized) return null;
       return path.join(newFilesDir, `${sanitized}.md`);
     }
-    return path.join(newFilesDir, `${first}.md`);
+    return path.join(newFilesDir, `${partner}.md`);
   }
 
-  private extractFirstName(topic: string): string | null {
-    // "Amit:Howard" → "Amit"
+  private extractPartnerName(topic: string): string | null {
+    // "Amit:Howard" → "Amit" (if not self)
+    // "Howard:Amit" → "Amit" (returns the non-owner side)
     // "Jeremy:Howard 1:1" → "Jeremy"
     // "Zoom Meeting" → null
-    // "Shared Services Managers Meeting" → null (caller falls back to sanitized topic)
     const colonIdx = topic.indexOf(":");
     if (colonIdx <= 0) return null;
-    const firstName = topic.substring(0, colonIdx).trim();
-    // Sanity check: single word, not "Zoom"
-    if (/\s/.test(firstName) || firstName.toLowerCase() === "zoom") return null;
-    return firstName;
+
+    const before = topic.substring(0, colonIdx).trim();
+    const afterRaw = topic.substring(colonIdx + 1).trim();
+    const after = afterRaw.split(/\s+/)[0]; // first word after colon
+
+    const isValid = (s: string) =>
+      s.length > 0 && !/\s/.test(s) && s.toLowerCase() !== "zoom" && !this.isSelf(s);
+
+    if (isValid(before)) return before;
+    if (isValid(after)) return after;
+    return null;
   }
 
   /**
@@ -469,22 +490,22 @@ export class ObsidianClient {
       }
     }
 
-    // Skip multi-person meetings (more than 1 non-Howard attendee = not a 1:1)
+    // Skip multi-person meetings (more than 1 non-owner attendee = not a 1:1)
     const otherAttendees = attendeeNames.filter(
-      (n) => !n.toLowerCase().includes("howard") && !/\d/.test(n)
+      (n) => !this.isSelf(n) && !/\d/.test(n)
     );
     if (otherAttendees.length > 1) {
       return {
         success: false,
-        message: `"${topic}" has ${otherAttendees.length} non-Howard attendees — skipping multi-person meeting.`,
+        message: `"${topic}" has ${otherAttendees.length} non-owner attendees — skipping multi-person meeting.`,
         action: "no_match",
       };
     }
 
     // Fallback: check topic for 3+ colon-separated names (e.g. "Gaetan:Howard:Tony")
     const topicParts = topic.split(":").map((s) => s.trim()).filter(Boolean);
-    const topicNonHoward = topicParts.filter((p) => /[a-zA-Z]{2,}/.test(p) && !p.toLowerCase().includes("howard"));
-    if (topicNonHoward.length > 1) {
+    const topicNonOwner = topicParts.filter((p) => /[a-zA-Z]{2,}/.test(p) && !this.isSelf(p));
+    if (topicNonOwner.length > 1) {
       return {
         success: false,
         message: `"${topic}" has multiple people in topic — skipping multi-person meeting.`,

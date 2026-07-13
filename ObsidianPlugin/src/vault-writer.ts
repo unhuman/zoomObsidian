@@ -26,19 +26,31 @@ export class VaultWriter {
   private oneOnOneFolders: string[];
   private _fileCache: { name: string; path: string }[] | null = null;
   private fileContentCache = new Map<string, string>();
+  private myDisplayName: string;
+  private ownerFirst: string;
 
   constructor(
     app: App,
-    opts?: { vaultSubfolder?: string; oneOnOneFolders?: string[] }
+    opts?: { vaultSubfolder?: string; oneOnOneFolders?: string[]; myDisplayName?: string }
   ) {
     this.app = app;
     this.vaultSubfolder = opts?.vaultSubfolder ?? "";
     this.oneOnOneFolders = opts?.oneOnOneFolders ?? DEFAULT_ONE_ON_ONE_FOLDERS;
+    this.myDisplayName = opts?.myDisplayName ?? "";
+    this.ownerFirst = this.myDisplayName.split(/\s+/)[0].toLowerCase();
   }
 
   /** Invalidate cached file list (call after settings change). */
   clearCache(): void {
     this._fileCache = null;
+  }
+
+  /**
+   * Check if a name is the owner (by checking first word).
+   */
+  private isSelf(name: string): boolean {
+    if (!this.ownerFirst) return false;
+    return name.toLowerCase().includes(this.ownerFirst);
   }
 
   /**
@@ -84,7 +96,7 @@ export class VaultWriter {
    *
    * Match priority:
    *  0. Exact full attendee name matches file name
-   *  1. File name starts with topic first name (prefer solo over shared)
+   *  1. File name starts with topic partner name (prefer solo over shared)
    *  2. File name starts with any attendee first name
    *  3. File name contains first name as word boundary
    */
@@ -92,7 +104,7 @@ export class VaultWriter {
     meetingTopic: string,
     attendeeNames?: string[]
   ): Promise<string | null> {
-    const topicFirst = this.extractFirstName(meetingTopic);
+    const topicPartner = this.extractPartnerName(meetingTopic);
     const files = await this.allFiles();
     const norm = (s: string) => s.toLowerCase().trim();
 
@@ -107,7 +119,7 @@ export class VaultWriter {
       .map((n) => n.split(/\s+/)[0])
       .filter(Boolean);
     const candidateFirstNames = [
-      ...(topicFirst ? [topicFirst] : []),
+      ...(topicPartner ? [topicPartner] : []),
       ...attendeeFirstNames,
     ].filter(Boolean);
 
@@ -148,8 +160,8 @@ export class VaultWriter {
     const best = (attendeeNames ?? [])[0];
     if (best) return normalizePath(`${base}/${best}.md`);
 
-    const first = this.extractFirstName(meetingTopic);
-    if (first) return normalizePath(`${base}/${first}.md`);
+    const partner = this.extractPartnerName(meetingTopic);
+    if (partner) return normalizePath(`${base}/${partner}.md`);
 
     // No colon pattern: use the sanitized topic itself as the filename so that
     // plain-named meetings like "Shared Services Managers Meeting" get a target file.
@@ -172,12 +184,20 @@ export class VaultWriter {
     return null;
   }
 
-  private extractFirstName(topic: string): string | null {
+  private extractPartnerName(topic: string): string | null {
     const colonIdx = topic.indexOf(":");
     if (colonIdx <= 0) return null;
-    const firstName = topic.substring(0, colonIdx).trim();
-    if (/\s/.test(firstName) || firstName.toLowerCase() === "zoom") return null;
-    return firstName;
+
+    const before = topic.substring(0, colonIdx).trim();
+    const afterRaw = topic.substring(colonIdx + 1).trim();
+    const after = afterRaw.split(/\s+/)[0]; // first word after colon
+
+    const isValid = (s: string) =>
+      s.length > 0 && !/\s/.test(s) && s.toLowerCase() !== "zoom" && !this.isSelf(s);
+
+    if (isValid(before)) return before;
+    if (isValid(after)) return after;
+    return null;
   }
 
   /**
