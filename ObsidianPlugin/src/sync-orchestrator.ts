@@ -641,14 +641,21 @@ export class SyncOrchestrator {
         continue;
       }
       if (!entryWriter.hasSummaryContent(summary)) {
-        const errorDetail = (summary as Record<string, unknown>).error
-          ? ` error=${String((summary as Record<string, unknown>).error)}`
-          : "";
-        this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — skipping write until data is ready`);
-        skipped++;
-        results.push({ topic, status: `PENDING @ ${parsedDate}` });
-        // CRITICAL: Do NOT add to toDelete — pending meetings are retried on next sync when data is ready.
-        // Deleting now would lose the meeting without capturing its summary.
+        if (entryWriter.isTranscriptMissing(summary)) {
+          this.dbg(`[info] No transcript for "${topic}" (${rawId}) — marking MISSING`);
+          skipped++;
+          results.push({ topic, status: `MISSING @ ${parsedDate}` });
+          toDelete.push({ topic, rawId });
+        } else {
+          const errorDetail = (summary as Record<string, unknown>).error
+            ? ` error=${String((summary as Record<string, unknown>).error)}`
+            : "";
+          this.dbg(`[warn] Empty summary for "${topic}" (${rawId})${errorDetail} — skipping write until data is ready`);
+          skipped++;
+          results.push({ topic, status: `PENDING @ ${parsedDate}` });
+          // CRITICAL: Do NOT add to toDelete — pending meetings are retried on next sync when data is ready.
+          // Deleting now would lose the meeting without capturing its summary.
+        }
         continue;
       }
       try {

@@ -242,6 +242,23 @@ export class ObsidianClient {
   }
 
   /**
+   * Returns true if the summary indicates an insufficient transcript (no summary will ever be generated).
+   * Searches all string fields in the summary object for Zoom's error messages.
+   */
+  isTranscriptMissing(summary: ZoomSummaryData): boolean {
+    const missingPatterns = [
+      /insufficient transcript/i,
+      /summary was not generated/i,
+    ];
+    for (const val of Object.values(summary as Record<string, unknown>)) {
+      if (typeof val === "string" && missingPatterns.some(p => p.test(val))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Format just the Zoom AI Summary content (no date header), indented at `baseIndent`.
    * Used both for standalone sections (baseIndent='') and for appending under an
    * existing same-day manual note block (baseIndent='\t').
