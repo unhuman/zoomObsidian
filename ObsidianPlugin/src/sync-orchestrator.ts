@@ -691,23 +691,30 @@ export class SyncOrchestrator {
     let deleted = 0;
     let deleteFailed = 0;
 
+    this.dbg(`[info] Phase 6: autoDelete=${autoDelete}, toDelete.length=${toDelete.length}, meetings to delete: ${toDelete.map(d => `"${d.topic}" (${d.rawId})`).join(", ")}`);
     if (autoDelete && toDelete.length > 0) {
       this.progress(`Deleting ${toDelete.length} summaries from Zoom...`);
       for (const { topic, rawId } of toDelete) {
         try {
+          this.dbg(`[debug] Deleting "${topic}" (${rawId})...`);
           const r = await this.client.deleteSummary(rawId);
           if (r.success) {
             deleted++;
             this.progress(`  ✓ ${rawId} ${topic}`);
+            this.dbg(`[debug] Successfully deleted "${topic}" (${rawId})`);
           } else {
             deleteFailed++;
             this.progress(`  ✗ ${rawId} ${topic}: ${r.message}`);
+            this.dbg(`[warn] Failed to delete "${topic}" (${rawId}): ${r.message}`);
           }
         } catch (e) {
           deleteFailed++;
           this.progress(`  ✗ ${rawId} ${topic}: ${(e as Error).message}`);
+          this.dbg(`[error] Exception deleting "${topic}" (${rawId}): ${(e as Error).message}`);
         }
       }
+    } else if (toDelete.length > 0) {
+      this.dbg(`[info] autoDelete is disabled; skipping deletion of ${toDelete.length} meetings`);
     }
 
     // Phase 7: report
