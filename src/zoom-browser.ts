@@ -118,28 +118,26 @@ export class ZoomBrowser {
     const signinUrl = `${this.baseUrl}/signin`;
     await this.page.goto(signinUrl, { waitUntil: "networkidle2" });
 
-    // Wait for user to complete login (detected by page content changing from spinner)
-    console.error("Waiting for login to complete...");
+    // Wait for user to complete login (page title changes from "Cvent - Sign In" or URL leaves auth paths)
+    console.error("Waiting for login to complete. Check browser window and complete any remaining auth steps...");
     await this.page.waitForFunction(
       () => {
-        // Look for spinner/loading indicators disappearing
-        const spinnerElements = document.querySelectorAll(
-          '[class*="spinner"], [class*="loading"], [class*="loader"], .zm-spinner'
-        );
-        const hasVisibleSpinner = Array.from(spinnerElements).some(el => {
-          const htmlEl = el as HTMLElement;
-          return htmlEl.offsetParent !== null; // visible (not display:none)
-        });
+        const url = window.location.href;
+        const title = document.title || "";
 
-        // Check for actual Zoom page content (nav, headers, etc.)
-        const hasPageContent = !!document.querySelector(
-          '.zm-header, nav, [role="navigation"], main, [role="main"]'
-        );
+        // Success conditions:
+        // 1. URL left auth paths (no /signin, /login, /sso in path)
+        // 2. OR page title changed (indicating page loaded)
+        const leftAuthPath = url.includes(this.baseUrl) &&
+                            !url.includes("/signin") &&
+                            !url.includes("/login") &&
+                            !url.includes("/sso");
+        const titleChanged = title && !title.includes("Sign In") && !title.includes("Cvent");
 
-        // Success: no visible spinner AND page has content
-        return !hasVisibleSpinner && hasPageContent;
+        return leftAuthPath || titleChanged;
       },
-      { timeout: 300_000 } // 5 minute timeout for login
+      { timeout: 60_000 }, // 60 second timeout — auth should complete quickly
+      this.baseUrl
     );
 
     // Verify session is fully established by navigating to profile and checking for UI elements
