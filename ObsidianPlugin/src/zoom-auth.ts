@@ -169,15 +169,21 @@ export class ZoomAuth {
           const url = win.webContents.getURL();
           const title = win.getTitle();
 
-          // Success: URL left auth paths OR title changed from "Sign In"
+          this.dbg(`[check] URL: ${url.split("?")[0]}, title: "${title}"`);
+
+          // Success: URL left auth paths AND we're at a real Zoom page (not auth/SSO)
           const leftAuthPaths =
             url.startsWith(this.baseUrl) &&
             !url.includes("/signin") &&
             !url.includes("/login") &&
-            !url.includes("/sso");
-          const titleChanged = title && !title.includes("Sign In") && !title.includes("Cvent");
+            !url.includes("/sso") &&
+            !url.includes("/auth") &&
+            !url.includes("samlredirect");
 
-          if (leftAuthPaths || titleChanged) {
+          // Also require that we're at a substantive Zoom page (has path)
+          const isSubstantivePage = url.length > (this.baseUrl.length + 10);
+
+          if (leftAuthPaths && isSubstantivePage) {
             this.dbg("Login detected — URL:", url.split("?")[0], "title:", title);
             loginDetected = true;
             clearInterval(pollInterval);
