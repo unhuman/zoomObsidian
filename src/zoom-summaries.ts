@@ -85,14 +85,22 @@ export class ZoomSummariesClient {
     if (!currentHash.startsWith(expectedHash)) {
       this.dbg(`[listSummaries] Hash mismatch (have="${currentHash}", want="${expectedHash}") — forcing route`);
       await page.evaluate((h: string) => { window.location.hash = h; }, expectedHash);
-      await new Promise((r) => setTimeout(r, 800));
+      // Wait for the table to render after hash change
+      await page.waitForSelector(
+        ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, .zm-table__empty, .zm-empty-state, .empty-state",
+        { timeout: 10000 }
+      ).catch(() => {
+        process.stderr.write("[WARN] Timed out waiting for summary table after hash correction\n");
+      });
     }
 
     // Wait for Zoom's table body to render (zm-table__body-wrapper holds the data rows)
     await page.waitForSelector(
       ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, .zm-table__empty, .zm-empty-state, .empty-state",
       { timeout: 15000 }
-    ).catch(() => {});
+    ).catch(() => {
+      process.stderr.write("[WARN] Timed out waiting for Zoom summary table to render\n");
+    });
 
     const allSummaries: MeetingSummaryItem[] = [];
 
@@ -160,13 +168,13 @@ export class ZoomSummariesClient {
       await new Promise((r) => setTimeout(r, 500));
     }
 
-    // Fallback if body table was never found — return raw page text
+    // If no rows were found, log a warning but return empty array (not a synthetic object)
     if (allSummaries.length === 0) {
       const text = await page.evaluate(() => {
         const main = document.querySelector("main, #content, .content, [role=main]");
-        return (main ?? document.body).textContent?.trim()?.substring(0, 5000) ?? "";
+        return (main ?? document.body).textContent?.trim()?.substring(0, 500) ?? "";
       });
-      return [{ page_text: text } as unknown as MeetingSummaryItem];
+      process.stderr.write(`[WARN] listSummaries: no meeting rows found. Page text: ${text}\n`);
     }
 
     return allSummaries;

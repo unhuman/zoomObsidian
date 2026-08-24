@@ -201,6 +201,14 @@ function isAmbiguousMatch(firstName) {
 // Phase 1: list meetings
 const t0       = Date.now();
 const allMeetings = await summariesClient.listSummaries();
+
+// Early exit if no meetings found
+if (allMeetings.length === 0) {
+  process.stderr.write('No meetings found. Session may have expired, Zoom returned an empty list, or no summaries exist in your configured date range.\n');
+  await browser.close();
+  process.exit(0);
+}
+
 const meetings = FILTER
   ? allMeetings.filter(m => (m.meeting_topic ?? m.column_1 ?? '').toLowerCase().includes(FILTER.toLowerCase()))
   : allMeetings;

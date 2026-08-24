@@ -125,6 +125,18 @@ export class ZoomBrowser {
       expectedBase
     );
 
+    // Verify session is fully established by navigating to profile and checking for UI elements
+    console.error("Verifying session stability...");
+    try {
+      await this.page.goto(`${this.baseUrl}/profile`, { waitUntil: "domcontentloaded", timeout: 15000 });
+      await this.page.waitForSelector(
+        '.zm-header .nar-avatar, .nav-right, [class*="user-avatar"]',
+        { timeout: 10000 }
+      );
+    } catch (e) {
+      throw new Error(`Login appeared to succeed but Zoom profile page did not fully load. Session may be unstable. Error: ${e}`);
+    }
+
     console.error("Login successful! Saving session...");
     const cookies = await this.page.cookies();
     await this.saveCookies(cookies);
@@ -133,6 +145,9 @@ export class ZoomBrowser {
     const headlessBrowser = await puppeteer.launch({ headless: true });
     const headlessPage = await headlessBrowser.newPage();
     await headlessPage.setCookie(...cookies);
+
+    // Prime the headless page with the summaries URL to ensure it's authenticated
+    await headlessPage.goto(`${this.baseUrl}/user/meeting/summary#/list`, { waitUntil: "domcontentloaded", timeout: 15000 });
 
     await this.browser.close();
     this.browser = headlessBrowser;
