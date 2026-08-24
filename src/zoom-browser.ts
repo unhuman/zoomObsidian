@@ -144,27 +144,41 @@ export class ZoomBrowser {
     );
 
     // At this point, we've confirmed we left auth pages. Session is established.
-    console.error("Login successful! Saving session...");
+    console.error("Login successful! Capturing cookies...");
     const cookies = await this.page.cookies();
+    console.error(`Captured ${cookies.length} cookies`);
+
     if (!cookies || cookies.length === 0) {
-      console.error("No cookies found after login. Session may be invalid.");
+      console.error("ERROR: No cookies found after login. Session may be invalid.");
       await this.deleteCookies();
       throw new Error("Login appeared to succeed but no session cookies were captured.");
     }
-    await this.saveCookies(cookies);
 
-    // Now switch to headless for actual work
+    console.error("Saving cookies to disk...");
+    await this.saveCookies(cookies);
+    console.error("Cookies saved successfully.");
+
+    console.error("Switching to headless browser...");
     const headlessBrowser = await puppeteer.launch({ headless: true });
     const headlessPage = await headlessBrowser.newPage();
+    console.error("Setting cookies on headless page...");
     await headlessPage.setCookie(...cookies);
 
-    // Prime the headless page with the summaries URL to ensure it's authenticated
-    await headlessPage.goto(`${this.baseUrl}/user/meeting/summary#/list`, { waitUntil: "domcontentloaded", timeout: 15000 });
+    console.error("Navigating to summaries page...");
+    try {
+      await headlessPage.goto(`${this.baseUrl}/user/meeting/summary#/list`, { waitUntil: "domcontentloaded", timeout: 15000 });
+      console.error("Summaries page loaded.");
+    } catch (e) {
+      console.error(`Failed to load summaries page: ${e}`);
+      throw e;
+    }
 
+    console.error("Closing visible browser...");
     await this.browser.close();
     this.browser = headlessBrowser;
     this.page = headlessPage;
 
+    console.error("Authentication complete!");
     return this.page;
   }
 
