@@ -104,6 +104,9 @@ export class ZoomBrowser {
   }
 
   private async interactiveLogin(): Promise<Page> {
+    // Delete any stale cookies before starting fresh login
+    await this.deleteCookies();
+
     console.error(
       "Opening browser for Zoom login. Please sign in, then the process will continue automatically."
     );
