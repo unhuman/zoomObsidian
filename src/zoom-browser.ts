@@ -29,8 +29,16 @@ export class ZoomBrowser {
   }
 
   get baseUrl(): string {
-    const sub = this.config.zoomSubdomain;
-    return sub ? `https://${sub}.zoom.us` : "https://zoom.us";
+    let sub = this.config.zoomSubdomain;
+    if (!sub) return "https://zoom.us";
+
+    // If user entered the full domain (e.g., "cvent.zoom.us"), extract just the subdomain
+    if (sub.includes(".zoom.us")) {
+      sub = sub.replace(".zoom.us", "").replace(".zoom.com", "");
+      console.error(`[config] Subdomain had full domain, extracted: ${sub}`);
+    }
+
+    return `https://${sub}.zoom.us`;
   }
 
   private async saveCookies(cookies: Cookie[]): Promise<void> {
