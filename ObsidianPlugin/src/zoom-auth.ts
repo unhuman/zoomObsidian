@@ -161,17 +161,26 @@ export class ZoomAuth {
         });
 
         const signinUrl = `${this.baseUrl}/signin`;
+        let loginDetected = false;
 
-        // Detect successful login by URL change
+        // Detect successful login by URL change or page title
         const checkUrl = () => {
+          if (loginDetected) return; // Already detected, ignore further checks
           const url = win.webContents.getURL();
-          if (
+          const title = win.getTitle();
+
+          // Success: URL left auth paths OR title changed from "Sign In"
+          const leftAuthPaths =
             url.startsWith(this.baseUrl) &&
             !url.includes("/signin") &&
             !url.includes("/login") &&
-            !url.includes("/sso")
-          ) {
-            this.dbg("Login detected at URL:", url);
+            !url.includes("/sso");
+          const titleChanged = title && !title.includes("Sign In") && !title.includes("Cvent");
+
+          if (leftAuthPaths || titleChanged) {
+            this.dbg("Login detected — URL:", url.split("?")[0], "title:", title);
+            loginDetected = true;
+            clearInterval(pollInterval);
             extractCookies();
           }
         };
@@ -201,11 +210,31 @@ export class ZoomAuth {
           }
         };
 
+        // Listen for navigation events
         win.webContents.on("did-navigate", checkUrl);
         win.webContents.on("did-navigate-in-page", checkUrl);
+
+        // Also poll every 500ms in case the page changes without triggering navigation events
+        // (e.g., Zoom's SSO spinner staying on same URL)
+        const pollInterval = setInterval(checkUrl, 500);
+
+        // Timeout after 5 minutes
+        const loginTimeout = setTimeout(() => {
+          if (!loginDetected) {
+            this.dbg("Login timeout after 5 minutes");
+            clearInterval(pollInterval);
+            win.close();
+            reject(new Error("Login timeout — please try again"));
+          }
+        }, 300_000);
+
         win.on("closed", () => {
+          clearInterval(pollInterval);
+          clearTimeout(loginTimeout);
           // If the window is closed before login, just resolve silently
-          resolve();
+          if (!loginDetected) {
+            resolve();
+          }
         });
 
         win.loadURL(signinUrl);
