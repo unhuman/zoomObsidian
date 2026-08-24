@@ -104,6 +104,10 @@ export class ZoomSummariesClient {
 
     const allSummaries: MeetingSummaryItem[] = [];
 
+    // Set shorter default timeout for all page operations
+    page.setDefaultNavigationTimeout(10000);
+    page.setDefaultTimeout(10000);
+
     // Helper to extract rows from whichever body table is present
     const scrapeRows = () => page.evaluate(() => {
       const results: Record<string, unknown>[] = [];
@@ -132,40 +136,63 @@ export class ZoomSummariesClient {
       return results;
     });
 
-    // Paginate: scrape current page, click next until disabled
-    while (true) {
-      const rows = await scrapeRows();
-      allSummaries.push(...(rows as MeetingSummaryItem[]));
+    // Paginate: scrape current page, click next until disabled (with safety limit)
+    let pageCount = 0;
+    const MAX_PAGES = 100; // safety limit to prevent infinite loops
+    while (pageCount < MAX_PAGES) {
+      pageCount++;
+      try {
+        const rows = await scrapeRows();
+        allSummaries.push(...(rows as MeetingSummaryItem[]));
+      } catch (e) {
+        this.dbg(`[scrapeRows] Error: ${e}`);
+        break;
+      }
 
       // Check whether the Next-page button exists and is not disabled
-      const hasNext = await page.evaluate(() => {
-        const btn = document.querySelector<HTMLButtonElement>("button.btn-next");
-        return !!btn && !btn.disabled && btn.getAttribute("aria-disabled") !== "true";
-      });
+      let hasNext = false;
+      try {
+        hasNext = await page.evaluate(() => {
+          const btn = document.querySelector<HTMLButtonElement>("button.btn-next");
+          return !!btn && !btn.disabled && btn.getAttribute("aria-disabled") !== "true";
+        });
+      } catch (e) {
+        this.dbg(`[hasNext check] Error: ${e}`);
+        break;
+      }
 
       if (!hasNext) break;
 
-      // Note the current active page number so we can detect when the page turns
-      const currentPage = await page.evaluate(() => {
-        const active = document.querySelector<HTMLElement>(".zm-pager li.number.active");
-        return active?.getAttribute("data-page") ?? active?.textContent?.trim();
-      });
-
-      await page.click("button.btn-next");
-
-      // Wait until the active page indicator changes or a new set of rows appears
-      await page.waitForFunction(
-        (prevPage: string | undefined) => {
+      try {
+        // Note the current active page number so we can detect when the page turns
+        const currentPage = await page.evaluate(() => {
           const active = document.querySelector<HTMLElement>(".zm-pager li.number.active");
-          const newPage = active?.getAttribute("data-page") ?? active?.textContent?.trim();
-          return !!newPage && newPage !== prevPage;
-        },
-        { timeout: 15000 },
-        currentPage ?? undefined
-      ).catch(() => {});
+          return active?.getAttribute("data-page") ?? active?.textContent?.trim();
+        });
 
-      // Brief settle time for Vue reactivity to finish rendering rows
-      await new Promise((r) => setTimeout(r, 500));
+        await page.click("button.btn-next");
+
+        // Wait until the active page indicator changes or a new set of rows appears
+        await page.waitForFunction(
+          (prevPage: string | undefined) => {
+            const active = document.querySelector<HTMLElement>(".zm-pager li.number.active");
+            const newPage = active?.getAttribute("data-page") ?? active?.textContent?.trim();
+            return !!newPage && newPage !== prevPage;
+          },
+          { timeout: 15000 },
+          currentPage ?? undefined
+        ).catch(() => {});
+
+        // Brief settle time for Vue reactivity to finish rendering rows
+        await new Promise((r) => setTimeout(r, 500));
+      } catch (e) {
+        this.dbg(`[pagination] Error: ${e}`);
+        break;
+      }
+    }
+
+    if (pageCount >= MAX_PAGES) {
+      process.stderr.write(`[WARN] Pagination exceeded max pages (${MAX_PAGES}), stopping\n`);
     }
 
     // If no rows were found, log a warning but return empty array (not a synthetic object)
