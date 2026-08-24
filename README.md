@@ -177,3 +177,32 @@ npm run build  # Compile TypeScript → build/
 npm run dev    # Watch mode (tsc --watch)
 npm start      # Run the MCP server (stdio transport)
 ```
+
+### Version Bumping Checklist
+
+**Before committing code changes**, bump the version in **ALL THREE files**:
+
+1. `package.json` (main package)
+2. `ObsidianPlugin/package.json` (plugin package)
+3. `ObsidianPlugin/manifest.json` (must stay in sync with plugin package.json)
+
+Use semantic versioning:
+- `PATCH` (x.y.Z) — bug fixes and small improvements
+- `MINOR` (x.Y.z) — new features or settings
+- `MAJOR` (X.y.z) — breaking changes
+
+**Example workflow:**
+```bash
+# 1. Make code changes
+# 2. Bump version in all three files (e.g., 1.2.10 → 1.2.11)
+# 3. Rebuild
+npm run build
+# 4. Commit code + version bump together
+git add .
+git commit -m "fix/feat/docs: description here"
+```
+
+⚠️ **Never commit code changes without updating all three version numbers.** If they diverge, the build output version won't match what Obsidian displays to users.
+
+**Related docs:**
+- See `ObsidianPlugin/CLAUDE.md` for detailed versioning requirements and consequences of version mismatch
