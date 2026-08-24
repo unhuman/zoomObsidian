@@ -96,13 +96,60 @@ export class SyncOrchestrator {
   }
 
   /**
-   * Run the full sync workflow. Returns a report of all actions taken.
+   * Run the full sync workflow with timeout protection. Returns a report of all actions taken.
    * Processes both owned and shared meetings (if configured).
    *
    * @param opts.filter   — Optional topic substring filter.
    * @param opts.autoDelete — If true, delete summaries from Zoom after writing.
+   * @param opts.timeoutMs — Overall timeout in milliseconds (default: 10 minutes).
    */
   async run(opts?: {
+    filter?: string;
+    autoDelete?: boolean;
+    timeoutMs?: number;
+  }): Promise<SyncReport> {
+    const timeoutMs = opts?.timeoutMs ?? 600_000; // 10 minutes default
+
+    try {
+      return await this.runWithTimeout(opts, timeoutMs);
+    } catch (e) {
+      const msg = `Sync failed: ${(e as Error).message}`;
+      this.progress(msg);
+      notify(msg);
+      throw e;
+    }
+  }
+
+  /**
+   * Internal: run with timeout protection.
+   */
+  private async runWithTimeout(
+    opts: { filter?: string; autoDelete?: boolean } | undefined,
+    timeoutMs: number
+  ): Promise<SyncReport> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        const msg = `Sync timeout after ${(timeoutMs / 1000).toFixed(0)}s`;
+        this.progress(msg);
+        reject(new Error(msg));
+      }, timeoutMs);
+
+      this.runInternal(opts)
+        .then((result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        })
+        .catch((e) => {
+          clearTimeout(timeout);
+          reject(e);
+        });
+    });
+  }
+
+  /**
+   * Internal: actual sync implementation.
+   */
+  private async runInternal(opts?: {
     filter?: string;
     autoDelete?: boolean;
   }): Promise<SyncReport> {
@@ -129,7 +176,7 @@ export class SyncOrchestrator {
 
     // Always process owned meetings (full scan every time — owned meetings
     // are deletable, so incremental timestamps aren't needed).
-    this.progress("Processing owned Zoom meetings...");
+    this.progress("Phase 1-7: Processing owned Zoom meetings...");
     const ownedReport = await this.processMeetingSource(
       "owned",
       filter,
@@ -260,7 +307,7 @@ export class SyncOrchestrator {
     };
 
     // Phase 1: list meetings
-    this.progress(`Listing ${sourceType} meeting summaries...`);
+    this.progress(`[Phase 1] Listing ${sourceType} meeting summaries...`);
     const listOpts: { from?: string } = {};
     if (fromDate) {
       listOpts.from = fromDate;
@@ -276,7 +323,7 @@ export class SyncOrchestrator {
         )
       : allMeetings;
     this.progress(
-      `  Found ${allMeetings.length} ${sourceType} meetings${filter ? `, ${meetings.length} match filter "${filter}"` : ""}.`
+      `[Phase 1] Found ${allMeetings.length} ${sourceType} meetings${filter ? `, ${meetings.length} match filter "${filter}"` : ""}.`
     );
 
     const allFiles = await writer.allFiles();
@@ -292,7 +339,7 @@ export class SyncOrchestrator {
     };
 
     // Phase 2: resolve attendees for ambiguous/unmatched meetings
-    this.progress("Resolving attendees...");
+    this.progress(`[Phase 2] Resolving attendees for ambiguous meetings...`);
     const attendeesMap = new Map<string, string[]>(
       Object.entries(this.attendeesCache)
     );
@@ -371,7 +418,7 @@ export class SyncOrchestrator {
     }
 
     // Phase 3: build plan
-    this.progress("Building sync plan...");
+    this.progress(`[Phase 3] Building sync plan for ${meetings.length} meetings...`);
     const plan: SyncPlanEntry[] = [];
 
     for (const m of meetings) {
@@ -557,7 +604,7 @@ export class SyncOrchestrator {
     );
 
     // Phase 4: pre-fetch summaries
-    this.progress("Fetching summaries...");
+    this.progress(`[Phase 4] Fetching summaries for ${active.length} meetings...`);
     writer.clearFileCache();
     mainWriter?.clearFileCache();
     // Use instanceKey (rawId__date) to distinguish recurring meeting instances
@@ -592,23 +639,23 @@ export class SyncOrchestrator {
 
     if (toFetchFull.size > 0 && sourceType !== "shared") {
       this.progress(
-        `Pre-fetching nav IDs for ${toFetchFull.size} meetings...`
+        `[Phase 4] Pre-fetching nav IDs for ${toFetchFull.size} meetings...`
       );
       const uniqueIds = [...new Set([...toFetchFull.values()].map(v => v.rawId))];
       await this.client.prefetchNavIds(uniqueIds, sourceType);
     }
 
     for (const [instanceKey, { rawId, topic, dateHint }] of toFetchFull) {
-      this.progress(`  Fetching: ${topic} (${rawId}) date=${dateHint}...`);
+      this.progress(`[Phase 4] Fetching: ${topic} (${rawId})...`);
       try {
         this.summaryCache[instanceKey] = await this.client.getSummary(rawId, sourceType, topic, dateHint);
       } catch (e) {
-        this.progress(`  Error: ${(e as Error).message}`);
+        this.progress(`[Phase 4] Error: ${(e as Error).message}`);
       }
     }
 
     // Phase 5: write summaries
-    this.progress("Writing summaries...");
+    this.progress(`[Phase 5] Writing ${active.length} summaries to vault...`);
     let written = 0;
     let skipped = plan.length - active.length;
     let errors = 0;
@@ -693,23 +740,23 @@ export class SyncOrchestrator {
 
     this.dbg(`[info] Phase 6: autoDelete=${autoDelete}, toDelete.length=${toDelete.length}, meetings to delete: ${toDelete.map(d => `"${d.topic}" (${d.rawId})`).join(", ")}`);
     if (autoDelete && toDelete.length > 0) {
-      this.progress(`Deleting ${toDelete.length} summaries from Zoom...`);
+      this.progress(`[Phase 6] Deleting ${toDelete.length} summaries from Zoom...`);
       for (const { topic, rawId } of toDelete) {
         try {
           this.dbg(`[debug] Deleting "${topic}" (${rawId})...`);
           const r = await this.client.deleteSummary(rawId);
           if (r.success) {
             deleted++;
-            this.progress(`  ✓ ${rawId} ${topic}`);
+            this.progress(`[Phase 6] ✓ Deleted: ${topic}`);
             this.dbg(`[debug] Successfully deleted "${topic}" (${rawId})`);
           } else {
             deleteFailed++;
-            this.progress(`  ✗ ${rawId} ${topic}: ${r.message}`);
+            this.progress(`[Phase 6] ✗ Failed: ${topic}: ${r.message}`);
             this.dbg(`[warn] Failed to delete "${topic}" (${rawId}): ${r.message}`);
           }
         } catch (e) {
           deleteFailed++;
-          this.progress(`  ✗ ${rawId} ${topic}: ${(e as Error).message}`);
+          this.progress(`[Phase 6] ✗ Error: ${topic}: ${(e as Error).message}`);
           this.dbg(`[error] Exception deleting "${topic}" (${rawId}): ${(e as Error).message}`);
         }
       }
@@ -718,6 +765,7 @@ export class SyncOrchestrator {
     }
 
     // Phase 7: report
+    this.progress(`[Phase 7] Sync complete: ${written} written, ${skipped} skipped, ${errors} errors`);
     const report: SyncReport = {
       results,
       written,
