@@ -35,7 +35,6 @@ export class ZoomBrowser {
     // If user entered the full domain (e.g., "cvent.zoom.us"), extract just the subdomain
     if (sub.includes(".zoom.us")) {
       sub = sub.replace(".zoom.us", "").replace(".zoom.com", "");
-      console.error(`[config] Subdomain had full domain, extracted: ${sub}`);
     }
 
     return `https://${sub}.zoom.us`;
