@@ -118,21 +118,28 @@ export class ZoomBrowser {
     const signinUrl = `${this.baseUrl}/signin`;
     await this.page.goto(signinUrl, { waitUntil: "networkidle2" });
 
-    // Wait for user to complete login (detected by returning to the Zoom domain on a non-auth page)
+    // Wait for user to complete login (detected by page content changing from spinner)
     console.error("Waiting for login to complete...");
-    const expectedBase = this.baseUrl;
     await this.page.waitForFunction(
-      (base: string) => {
-        const url = window.location.href;
-        return (
-          url.startsWith(base) &&
-          !url.includes("/signin") &&
-          !url.includes("/login") &&
-          !url.includes("/sso")
+      () => {
+        // Look for spinner/loading indicators disappearing
+        const spinnerElements = document.querySelectorAll(
+          '[class*="spinner"], [class*="loading"], [class*="loader"], .zm-spinner'
         );
+        const hasVisibleSpinner = Array.from(spinnerElements).some(el => {
+          const htmlEl = el as HTMLElement;
+          return htmlEl.offsetParent !== null; // visible (not display:none)
+        });
+
+        // Check for actual Zoom page content (nav, headers, etc.)
+        const hasPageContent = !!document.querySelector(
+          '.zm-header, nav, [role="navigation"], main, [role="main"]'
+        );
+
+        // Success: no visible spinner AND page has content
+        return !hasVisibleSpinner && hasPageContent;
       },
-      { timeout: 300_000 }, // 5 minute timeout for login
-      expectedBase
+      { timeout: 300_000 } // 5 minute timeout for login
     );
 
     // Verify session is fully established by navigating to profile and checking for UI elements
