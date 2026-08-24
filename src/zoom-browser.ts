@@ -4,7 +4,7 @@
  */
 
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
-import { readFile, writeFile, mkdir } from "fs/promises";
+import { readFile, writeFile, mkdir, rm } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
 
@@ -49,6 +49,15 @@ export class ZoomBrowser {
     }
   }
 
+  private async deleteCookies(): Promise<void> {
+    try {
+      await rm(COOKIES_FILE);
+      console.error("Deleted stale cookies file.");
+    } catch {
+      // File doesn't exist or already deleted, ignore
+    }
+  }
+
   /**
    * Ensure we have an authenticated browser page.
    * If saved cookies exist and are valid, reuse them.
@@ -82,8 +91,9 @@ export class ZoomBrowser {
         return this.page;
       }
 
-      // Session expired — close and re-login
+      // Session expired — delete stale cookies and re-login
       console.error("Saved session expired. Opening browser for login...");
+      await this.deleteCookies();
       await this.browser.close();
       this.browser = null;
       this.page = null;
@@ -134,6 +144,8 @@ export class ZoomBrowser {
         { timeout: 10000 }
       );
     } catch (e) {
+      console.error("Session verification failed. Cookies will be deleted for a fresh login on retry.");
+      await this.deleteCookies();
       throw new Error(`Login appeared to succeed but Zoom profile page did not fully load. Session may be unstable. Error: ${e}`);
     }
 
