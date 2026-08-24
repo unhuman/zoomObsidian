@@ -16,6 +16,7 @@ No automated tests — testing is manual by loading the plugin in Obsidian.
 After code changes:
 
 1. **Update version** in BOTH `manifest.json` and `package.json` (see [Versioning](#versioning) section)
+   - ⚠️ **CRITICAL:** These must be kept in sync at all times. If they diverge, `npm run build` will reference the wrong version.
 2. **Build:** `npm run build`
 3. **Copy all three files** to the vault plugin directory:
    ```bash
@@ -111,9 +112,17 @@ This is a **desktop-only Obsidian plugin** that syncs Zoom AI meeting summaries 
 
 ### Versioning
 
-**CRITICAL: Update version in BOTH files BEFORE building and committing.**
+**⚠️ CRITICAL: Version must be kept in sync across BOTH `manifest.json` and `package.json`**
 
-Version must be kept in sync across two files: `manifest.json` and `package.json`. Use semantic versioning (`MAJOR.MINOR.PATCH`):
+If these files diverge:
+- `npm run build` will use the version from `package.json` in the build output
+- The version shown to Obsidian users comes from `manifest.json`
+- Users will see a mismatch between what `npm run build` reported and what Obsidian displays
+- Future version bumps may be ignored if the build script version falls behind
+
+**ALWAYS update version in BOTH files BEFORE building and committing.**
+
+Use semantic versioning (`MAJOR.MINOR.PATCH`):
 
 | Change type | Bump | Example |
 |-------------|------|---------|
