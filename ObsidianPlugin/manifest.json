@@ -1,7 +1,7 @@
 {
   "id": "zoom-obsidian",
   "name": "Zoom Meeting Summaries",
-  "version": "1.2.15",
+  "version": "1.2.16",
   "minAppVersion": "1.0.0",
   "description": "Syncs Zoom AI meeting summaries into your 1:1 notes. Uses browser-based cookie authentication — no Zoom API app required.",
   "author": "unhuman",

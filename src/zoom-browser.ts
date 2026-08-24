@@ -58,6 +58,19 @@ export class ZoomBrowser {
     }
   }
 
+  private async validateChrome(): Promise<void> {
+    try {
+      const browser = await puppeteer.launch({ headless: true });
+      await browser.close();
+    } catch (e) {
+      throw new Error(
+        `Chrome/Chromium not found. Install it with:\n` +
+        `  npx puppeteer browsers install chrome\n\n` +
+        `Error details: ${e}`
+      );
+    }
+  }
+
   /**
    * Ensure we have an authenticated browser page.
    * If saved cookies exist and are valid, reuse them.
@@ -67,6 +80,9 @@ export class ZoomBrowser {
     if (this.page) {
       return this.page;
     }
+
+    // Validate Chrome is available before proceeding
+    await this.validateChrome();
 
     // Try loading saved cookies first (headless)
     const savedCookies = await this.loadCookies();
