@@ -143,22 +143,14 @@ export class ZoomBrowser {
       this.baseUrl
     );
 
-    // Verify session is fully established by navigating to profile and checking for UI elements
-    console.error("Verifying session stability...");
-    try {
-      await this.page.goto(`${this.baseUrl}/profile`, { waitUntil: "domcontentloaded", timeout: 15000 });
-      await this.page.waitForSelector(
-        '.zm-header .nar-avatar, .nav-right, [class*="user-avatar"]',
-        { timeout: 10000 }
-      );
-    } catch (e) {
-      console.error("Session verification failed. Cookies will be deleted for a fresh login on retry.");
-      await this.deleteCookies();
-      throw new Error(`Login appeared to succeed but Zoom profile page did not fully load. Session may be unstable. Error: ${e}`);
-    }
-
+    // At this point, we've confirmed we left auth pages. Session is established.
     console.error("Login successful! Saving session...");
     const cookies = await this.page.cookies();
+    if (!cookies || cookies.length === 0) {
+      console.error("No cookies found after login. Session may be invalid.");
+      await this.deleteCookies();
+      throw new Error("Login appeared to succeed but no session cookies were captured.");
+    }
     await this.saveCookies(cookies);
 
     // Now switch to headless for actual work
