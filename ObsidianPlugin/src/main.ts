@@ -174,13 +174,16 @@ export default class ZoomObsidianPlugin extends Plugin {
         return true;
       }
 
-      // Session expired — show error and instructions
-      notify(
-        "Zoom session expired. Please run the CLI to authenticate:\n" +
-        "node zoom-meetings-to-obsidian.mjs\n\n" +
-        "Then return to Obsidian and try again."
-      );
-      return false;
+      // Session expired — open login window
+      notify("Zoom session expired. Opening login window…");
+      try {
+        await this.auth.login();
+        notify("Login successful. Sync will now proceed.");
+        return true;
+      } catch (e) {
+        notify(`Login failed: ${(e as Error).message}`);
+        return false;
+      }
     } catch (e) {
       checkNotice.hide();
       notify(`Authentication check failed: ${(e as Error).message}`);

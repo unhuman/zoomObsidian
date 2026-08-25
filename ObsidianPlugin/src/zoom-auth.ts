@@ -171,14 +171,17 @@ export class ZoomAuth {
       return this.loginViaPolling();
     }
 
+    // Delete any stale cookies before starting fresh login
+    await this.deleteCookies();
+
     return new Promise<void>((resolve, reject) => {
       // Use a dedicated partition so Zoom cookies don't leak to or from the
       // main Obsidian session
       const partition = "persist:zoom-obsidian";
       const ses = electronSession.fromPartition(partition);
 
-      // Pre-load any previously saved cookies into this session so that
-      // SSO providers that depend on prior Zoom cookies can complete the flow.
+      // Pre-load all previously saved cookies into this session.
+      // This includes Okta session cookies which are essential for SSO to complete.
       const loadPromises = this.cookies.map((c) =>
         ses.cookies.set({
           url: `https://${c.domain.replace(/^\./, "")}${c.path}`,
@@ -189,7 +192,9 @@ export class ZoomAuth {
           secure: c.secure,
           httpOnly: c.httpOnly,
           expirationDate: c.expirationDate,
-        }).catch(() => {/* ignore individual failures */})
+        }).catch((e) => {
+          this.dbg(`Failed to set cookie ${c.name} on domain ${c.domain}: ${(e as Error).message}`);
+        })
       );
 
       Promise.all(loadPromises).then(() => {
@@ -215,19 +220,27 @@ export class ZoomAuth {
 
           this.dbg(`[check] URL: ${url.split("?")[0]}, title: "${title}"`);
 
-          // Success: URL left auth paths AND we're at a real Zoom page (not auth/SSO)
+          // Success condition 1: URL left auth paths (even if stuck at Okta, that's part of SSO flow)
           const leftAuthPaths =
-            url.startsWith(this.baseUrl) &&
             !url.includes("/signin") &&
             !url.includes("/login") &&
             !url.includes("/sso") &&
             !url.includes("/auth") &&
             !url.includes("samlredirect");
 
-          // Also require that we're at a substantive Zoom page (has path)
-          const isSubstantivePage = url.length > (this.baseUrl.length + 10);
+          // Success condition 2: Page title changed from "Sign In" or "Cvent" (indicates authenticated page loaded)
+          const titleChanged = title &&
+            !title.includes("Sign In") &&
+            !title.includes("Cvent") &&
+            title.length > 5; // Avoid empty/placeholder titles
 
-          if (leftAuthPaths && isSubstantivePage) {
+          // Success if EITHER:
+          // - We left auth paths AND are at a substantive page, OR
+          // - Page title changed (indicates we reached an authenticated page even if URL is at Okta)
+          const isSubstantivePage = url.length > (this.baseUrl.length + 10);
+          const success = (leftAuthPaths && isSubstantivePage) || titleChanged;
+
+          if (success) {
             this.dbg("Login detected — URL:", url.split("?")[0], "title:", title);
             loginDetected = true;
             clearInterval(pollInterval);
@@ -237,9 +250,19 @@ export class ZoomAuth {
 
         const extractCookies = async () => {
           try {
+            // Navigate to a known Zoom page to ensure session is stable before extracting cookies
+            this.dbg("Navigating to Zoom profile page to stabilize session...");
+            await win.webContents.loadURL(`${this.baseUrl}/profile`);
+
+            // Wait briefly for profile page to fully load
+            await new Promise<void>((resolve) => {
+              setTimeout(() => resolve(), 1000);
+            });
+
             const allCookies = await ses.cookies.get({});
-            const zoomCookies: SerializedCookie[] = allCookies
-              .filter((c: { domain: string }) => c.domain.includes("zoom.us"))
+            // Save both Zoom and Okta cookies — Okta cookies are needed for SSO on next auth
+            const relevantCookies: SerializedCookie[] = allCookies
+              .filter((c: { domain: string }) => c.domain.includes("zoom.us") || c.domain.includes("okta.com"))
               .map((c: { name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expirationDate?: number }) => ({
                 name: c.name,
                 value: c.value,
@@ -249,10 +272,10 @@ export class ZoomAuth {
                 httpOnly: c.httpOnly,
                 expirationDate: c.expirationDate,
               }));
-            this.cookies = zoomCookies;
-            await this.persistCookies(zoomCookies);
+            this.cookies = relevantCookies;
+            await this.persistCookies(relevantCookies);
             notify("Zoom login successful — cookies saved.");
-            this.dbg("Saved", zoomCookies.length, "cookies");
+            this.dbg("Saved", relevantCookies.length, "cookies (zoom.us + okta.com domains)");
             win.close();
             resolve();
           } catch (e) {
@@ -343,10 +366,29 @@ export class ZoomAuth {
     }
   }
 
+  /** Delete the saved cookies file (used before fresh login). */
+  private async deleteCookies(): Promise<void> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require("fs");
+      const path = require("path");
+      const os = require("os");
+
+      const cliCookiesPath = path.join(os.homedir(), ".zoom-mcp", "cookies.json");
+      if (fs.existsSync(cliCookiesPath)) {
+        fs.unlinkSync(cliCookiesPath);
+        this.dbg("Deleted stale cookies file:", cliCookiesPath);
+      }
+    } catch (e) {
+      this.dbg("Could not delete cookies file:", (e as Error).message);
+    }
+  }
+
   /** Clear stored cookies. */
   async logout(): Promise<void> {
     this.cookies = [];
     await this.persistCookies([]);
+    await this.deleteCookies();
     notify("Zoom session cleared.");
   }
 }
