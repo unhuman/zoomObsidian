@@ -79,8 +79,39 @@ export class ZoomAuth {
     return [...this.cookies];
   }
 
+  /**
+   * Try to load cookies from CLI's shared location if plugin cookies are missing.
+   */
+  private async loadSharedCliCookies(): Promise<void> {
+    if (this.cookies.length > 0) return; // Already have cookies
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require("fs");
+      const path = require("path");
+      const os = require("os");
+
+      const cliCookiesPath = path.join(os.homedir(), ".zoom-mcp", "cookies.json");
+      if (fs.existsSync(cliCookiesPath)) {
+        const data = fs.readFileSync(cliCookiesPath, "utf-8");
+        const cliCookies = JSON.parse(data) as SerializedCookie[];
+        if (cliCookies.length > 0) {
+          this.dbg(`Loaded ${cliCookies.length} cookies from CLI at ${cliCookiesPath}`);
+          this.cookies = cliCookies;
+          await this.persistCookies(cliCookies);
+          notify("Using Zoom session from CLI authentication.");
+        }
+      }
+    } catch (e) {
+      this.dbg("Could not load CLI cookies:", (e as Error).message);
+    }
+  }
+
   /** Check whether stored cookies still grant access. */
   async isAuthenticated(): Promise<boolean> {
+    // First, try to load CLI cookies if we don't have any
+    await this.loadSharedCliCookies();
+
     if (!this.cookies.length) return false;
 
     // Try the HEAD check up to twice before giving up — transient network
