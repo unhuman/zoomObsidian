@@ -25,6 +25,53 @@ import { nodeRequest, type SimpleResponse } from "./node-http";
 const electron = require("electron");
 const { BrowserWindow: ElectronBrowserWindow, session: electronSession } = electron.remote;
 
+/**
+ * Condition for "the summary table has rendered", evaluated in the page.
+ *
+ * Zoom no longer wraps the data rows in `.zm-table__body-wrapper` /
+ * `.zm-table__body` on every route, so matching only those classes reports a
+ * timeout on a page that has in fact rendered its rows. The generic
+ * `table tbody tr` clause is the real backstop; the class-based clauses are
+ * kept because they match sooner when Zoom does use that markup.
+ */
+const TABLE_READY_JS = `
+  (function() {
+    var rows = document.querySelectorAll(${JSON.stringify(
+      ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr"
+    )});
+    for (var i = 0; i < rows.length; i++) {
+      // Zoom renders a loading skeleton of rows holding a single blank <td>.
+      // Requiring a multi-cell row with real text is what separates rendered
+      // data from that skeleton — matching bare 'tbody tr' reports ready far
+      // too early and the caller then scrapes an empty table.
+      var cells = rows[i].querySelectorAll('td');
+      if (cells.length >= 2 && (rows[i].textContent || '').trim().length > 0) return true;
+    }
+    return !!document.querySelector('.zm-table__empty, .zm-empty-state, .empty-state');
+  })()
+`;
+
+/**
+ * Identity of the rows currently rendered, as a string. Used to detect a page
+ * turn without depending on Zoom's pager markup. Skeleton rows are excluded so
+ * the fingerprint doesn't flicker to a loading state and read as "changed".
+ */
+const ROW_FINGERPRINT_JS = `
+  (function() {
+    var rows = document.querySelectorAll(${JSON.stringify(
+      ".zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr"
+    )});
+    var parts = [];
+    for (var i = 0; i < rows.length; i++) {
+      var cells = rows[i].querySelectorAll('td');
+      if (cells.length < 2) continue;
+      var t = (rows[i].textContent || '').trim();
+      if (t) parts.push(t.substring(0, 120));
+    }
+    return parts.join('||');
+  })()
+`;
+
 export class ZoomClient {
   private auth: ZoomAuth;
   private debug: boolean;
@@ -342,50 +389,78 @@ export class ZoomClient {
    * all pages, the SPA stays on the last page. Subsequent resolveNavId calls
    * must start from page 1 to find meetings sorted newest-first.
    */
-  private async resetToFirstPage(): Promise<void> {
-    const pageInfo = await this.execInWindow<{ active: string | null; hasFirst: boolean }>(`
+  /**
+   * Advance the summary table to the next page.
+   *
+   * Returns false when there is no next page, or when the rows never changed
+   * (treated as "no more pages" rather than retried). The page turn is
+   * detected from the rendered rows, not from Zoom's pager markup.
+   */
+  private async goToNextPage(): Promise<boolean> {
+    const hasNext = await this.execInWindow<boolean>(`
       (function() {
-        var active = document.querySelector('.zm-pager li.number.active');
-        var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-        var first = document.querySelector('.zm-pager li.number[data-page="1"]');
-        return { active: p, hasFirst: !!first };
+        var btn = document.querySelector('button.btn-next');
+        return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
       })()
     `);
-    if (pageInfo.active && pageInfo.active !== '1') {
-      this.dbg(`[resetToFirstPage] Currently on page ${pageInfo.active}, resetting to 1...`);
-      if (pageInfo.hasFirst) {
-        await this.execInWindow<void>(`document.querySelector('.zm-pager li.number[data-page="1"]').click()`);
-      } else {
-        // Click btn-prev repeatedly until we're on page 1
-        let safety = 20;
-        while (safety-- > 0) {
-          const cur = await this.execInWindow<string>(`
-            (function() {
-              var a = document.querySelector('.zm-pager li.number.active');
-              return a ? (a.getAttribute('data-page') || a.textContent.trim()) : '1';
-            })()
-          `);
-          if (cur === '1') break;
-          const hasPrev = await this.execInWindow<boolean>(`
-            (function() {
-              var btn = document.querySelector('button.btn-prev');
-              return !!btn && !btn.disabled;
-            })()
-          `);
-          if (!hasPrev) break;
-          await this.execInWindow<void>(`document.querySelector('button.btn-prev').click()`);
-          await new Promise((r) => setTimeout(r, 500));
-        }
-      }
-      // Wait for rows to re-render after page change
-      await this.waitForCondition(`
+    if (!hasNext) return false;
+
+    const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS);
+    await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
+
+    const changed = await this.waitForCondition(`
+      (function() {
+        var fp = ${ROW_FINGERPRINT_JS};
+        return fp !== '' && fp !== ${JSON.stringify(fingerprint)};
+      })()
+    `, 15000);
+
+    if (!changed) {
+      this.dbg("[pagination] Rows did not change after clicking next — stopping");
+      return false;
+    }
+
+    // Brief settle for Vue reactivity
+    await new Promise((r) => setTimeout(r, 500));
+    return true;
+  }
+
+  /**
+   * Rewind the summary table to page 1.
+   *
+   * Driven by the prev button rather than by '.zm-pager li.number.active':
+   * that selector had gone stale, which made this a silent no-op and left the
+   * window on whatever page a previous scan ended on.
+   */
+  private async resetToFirstPage(): Promise<void> {
+    let safety = 20;
+    let moved = false;
+
+    while (safety-- > 0) {
+      const hasPrev = await this.execInWindow<boolean>(`
         (function() {
-          var a = document.querySelector('.zm-pager li.number.active');
-          return !a || (a.getAttribute('data-page') || a.textContent.trim()) === '1';
+          var btn = document.querySelector('button.btn-prev');
+          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
+        })()
+      `);
+      if (!hasPrev) break;
+
+      const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS);
+      await this.execInWindow<void>(`document.querySelector('button.btn-prev').click()`);
+
+      const changed = await this.waitForCondition(`
+        (function() {
+          var fp = ${ROW_FINGERPRINT_JS};
+          return fp !== '' && fp !== ${JSON.stringify(fingerprint)};
         })()
       `, 10000);
+      if (!changed) break;
+      moved = true;
+    }
+
+    if (moved) {
       await new Promise((r) => setTimeout(r, 300));
-      this.dbg(`[resetToFirstPage] Now on page 1.`);
+      this.dbg("[resetToFirstPage] Rewound to page 1.");
     }
   }
 
@@ -518,14 +593,15 @@ export class ZoomClient {
     }
 
     // Wait for the SPA table to render
-    const tableReady = await this.waitForCondition(`
-      !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-         document.querySelector('.zm-table__body tbody tr') ||
-         document.querySelector('.zm-table__empty, .zm-empty-state, .empty-state'))
-    `, 15000);
+    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000);
 
+    // A timeout here is not fatal: scrapeRowsCode falls back to
+    // `table:last-of-type`, which still finds the rows when Zoom's markup has
+    // drifted away from the classes above. Log the diagnostics and scrape
+    // anyway — returning early here silently reported "0 meetings" on pages
+    // that were fully rendered.
     if (!tableReady) {
-      this.dbg("Table never appeared — checking page content");
+      this.dbg("Table wait timed out — scraping anyway; page content:");
       const pageInfo = await this.execInWindow<string>(`
         (function() {
           var main = document.querySelector('main, #content, .content, [role=main]') || document.body;
@@ -538,7 +614,6 @@ export class ZoomClient {
         })()
       `);
       this.dbg("Page diagnostics:", pageInfo);
-      return [];
     }
 
     const allSummaries: MeetingSummaryItem[] = [];
@@ -555,6 +630,9 @@ export class ZoomClient {
         var rows = bodyTable.querySelectorAll('tbody tr');
         rows.forEach(function(row) {
           var cells = row.querySelectorAll('td');
+          // Skip skeleton/spacer rows — they yielded phantom meetings with an
+          // empty topic and no ID, which then failed every downstream lookup.
+          if (cells.length < 2 || (row.textContent || '').trim().length === 0) return;
           var topicBtn = row.querySelector('button.topic-link, a.topic-link, td:first-child button, td:first-child a');
           var item = {};
           if (topicBtn) item.meeting_topic = topicBtn.textContent.trim();
@@ -580,47 +658,20 @@ export class ZoomClient {
       })()
     `;
 
-    while (true) {
+    const MAX_PAGES = 100; // safety limit, matching the CLI
+    let pageCount = 0;
+    while (pageCount < MAX_PAGES) {
+      pageCount++;
       const rows = await this.execInWindow<MeetingSummaryItem[]>(scrapeRowsCode);
-      this.dbg(`Scraped ${rows.length} rows from current page`);
+      this.dbg(`Scraped ${rows.length} rows from page ${pageCount}`);
       allSummaries.push(...rows);
 
-      // Check for next page
-      const hasNext = await this.execInWindow<boolean>(`
-        (function() {
-          var btn = document.querySelector('button.btn-next');
-          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
-        })()
-      `);
-      if (!hasNext) break;
-
-      // Note current page number
-      const currentPage = await this.execInWindow<string | null>(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          return active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-        })()
-      `);
-
-      // Click next
-      await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
-
-      // Wait for page indicator to change
-      const pageChanged = await this.waitForCondition(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-          return !!p && p !== ${JSON.stringify(currentPage)};
-        })()
-      `, 15000);
-
-      if (!pageChanged) {
-        this.dbg("Page did not change after clicking next — stopping pagination");
-        break;
-      }
-
-      // Brief settle for Vue reactivity
-      await new Promise((r) => setTimeout(r, 500));
+      // Pagination is markup-fragile, so it lives in one place — see
+      // goToNextPage(). The pager-based version stopped after page 1.
+      if (!(await this.goToNextPage())) break;
+    }
+    if (pageCount >= MAX_PAGES) {
+      this.dbg(`[WARN] Pagination hit the ${MAX_PAGES}-page cap — results may be truncated`);
     }
 
     this.dbg(`Total summaries found: ${allSummaries.length}`);
@@ -654,12 +705,10 @@ export class ZoomClient {
     await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
 
     // Wait for SPA table
-    const tableReady = await this.waitForCondition(`
-      !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-         document.querySelector('.zm-table__body tbody tr'))
-    `, 15000);
+    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000);
     console.log(`[zoom-client][resolveNavId] tableReady=${tableReady} id=${numericId} hash=${await this.execInWindow<string>(`window.location.hash`).catch(()=>'?')}`);
-    if (!tableReady) return null;
+    // Not fatal — the row-matching below queries the DOM directly, so let it
+    // try rather than reporting "not found" for a page that did render.
 
     // Reset to page 1 — the SPA may still be on a later page from a prior scan
     await this.resetToFirstPage();
@@ -671,7 +720,7 @@ export class ZoomClient {
           var id = ${JSON.stringify(numericId)};
           var dateHint = ${JSON.stringify(dateHint ?? '')};
           var rows = document.querySelectorAll(
-            '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr'
+            '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr'
           );
           var candidates = [];
           for (var i = 0; i < rows.length; i++) {
@@ -718,7 +767,7 @@ export class ZoomClient {
         // Dump first few rows to diagnose column layout
         const rowDump = await this.execInWindow<string[]>(`
           (function() {
-            var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr');
+            var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr');
             var out = [];
             for (var i = 0; i < Math.min(rows.length, 3); i++) {
               var cells = rows[i].querySelectorAll('td');
@@ -759,29 +808,7 @@ export class ZoomClient {
 
       // Check for next page
       this.dbg(`[resolveNavId] id=${numericId} not found on current page, checking pagination...`);
-      const hasNext = await this.execInWindow<boolean>(`
-        (function() {
-          var btn = document.querySelector('button.btn-next');
-          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
-        })()
-      `);
-      if (!hasNext) break;
-
-      const currentPage = await this.execInWindow<string | null>(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          return active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-        })()
-      `);
-      await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
-      await this.waitForCondition(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-          return !!p && p !== ${JSON.stringify(null)};
-        })()
-      `.replace(JSON.stringify(null), JSON.stringify(currentPage)), 15000);
-      await new Promise((r) => setTimeout(r, 500));
+      if (!(await this.goToNextPage())) break;
     }
 
     return null;
@@ -808,10 +835,7 @@ export class ZoomClient {
     await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
 
     // Wait for SPA table
-    await this.waitForCondition(`
-      !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-         document.querySelector('.zm-table__body tbody tr'))
-    `, 15000);
+    await this.waitForCondition(TABLE_READY_JS, 15000);
 
     // Reset to page 1 in case the SPA stayed on a later page
     await this.resetToFirstPage();
@@ -825,7 +849,7 @@ export class ZoomClient {
         (function() {
           var ids = ${JSON.stringify(neededArr)};
           var rows = document.querySelectorAll(
-            '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr'
+            '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr'
           );
           var found = [];
           for (var i = 0; i < rows.length; i++) {
@@ -847,7 +871,7 @@ export class ZoomClient {
           (function() {
             var id = ${JSON.stringify(numericId)};
             var rows = document.querySelectorAll(
-              '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr'
+              '.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr'
             );
             for (var i = 0; i < rows.length; i++) {
               var cells = rows[i].querySelectorAll('td');
@@ -883,75 +907,24 @@ export class ZoomClient {
 
         // Navigate back to list
         await this.execInWindow<void>(`window.location.hash = '#/${hashFragment}'`);
-        await this.waitForCondition(`
-          !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-             document.querySelector('.zm-table__body tbody tr'))
-        `, 10000);
+        await this.waitForCondition(TABLE_READY_JS, 10000);
 
-        // Re-navigate to the correct page if needed
+        // Returning to the list resets it to page 1, so walk forward again.
+        // Previously this asked the pager which page it was on; that selector
+        // had gone stale, so it fell back to blind timed clicks.
         if (currentPageNum > 1) {
-          const actualPage = await this.execInWindow<number>(`
-            (function() {
-              var active = document.querySelector('.zm-pager li.number.active');
-              var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : '1';
-              return parseInt(p, 10) || 1;
-            })()
-          `);
-
-          if (actualPage !== currentPageNum) {
-            this.dbg(`After hash-back: actualPage=${actualPage}, need=${currentPageNum}`);
-            // Try direct page button first
-            const directNav = await this.execInWindow<boolean>(`
-              (function() {
-                var btn = document.querySelector('.zm-pager li.number[data-page="${currentPageNum}"]');
-                if (btn) { btn.click(); return true; }
-                return false;
-              })()
-            `);
-            if (directNav) {
-              await this.waitForCondition(`
-                (function() {
-                  var active = document.querySelector('.zm-pager li.number.active');
-                  var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-                  return p === '${currentPageNum}';
-                })()
-              `, 10000);
-            } else {
-              // Fall back to clicking Next from current position
-              for (let p = actualPage; p < currentPageNum; p++) {
-                await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
-                await new Promise((r) => setTimeout(r, 500));
-              }
+          await this.resetToFirstPage();
+          for (let p = 1; p < currentPageNum; p++) {
+            if (!(await this.goToNextPage())) {
+              this.dbg(`Could not return to page ${currentPageNum} (stopped at ${p})`);
+              break;
             }
-            await new Promise((r) => setTimeout(r, 300));
           }
         }
       }
 
       // Move to next page
-      const hasNext = await this.execInWindow<boolean>(`
-        (function() {
-          var btn = document.querySelector('button.btn-next');
-          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
-        })()
-      `);
-      if (!hasNext) break;
-
-      const currentPage = await this.execInWindow<string | null>(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          return active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-        })()
-      `);
-      await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
-      await this.waitForCondition(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-          return !!p && p !== ${JSON.stringify(currentPage)};
-        })()
-      `, 15000);
-      await new Promise((r) => setTimeout(r, 500));
+      if (!(await this.goToNextPage())) break;
       currentPageNum++;
     }
 
@@ -973,11 +946,8 @@ export class ZoomClient {
     const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
     await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
 
-    const tableReady = await this.waitForCondition(`
-      !!(document.querySelector('.zm-table__body-wrapper tbody tr') ||
-         document.querySelector('.zm-table__body tbody tr'))
-    `, 15000);
-    if (!tableReady) return null;
+    // A timeout is not fatal — the row match below queries the DOM directly.
+    await this.waitForCondition(TABLE_READY_JS, 15000);
 
     // Reset to page 1 in case the SPA stayed on a later page
     await this.resetToFirstPage();
@@ -987,7 +957,7 @@ export class ZoomClient {
         (function() {
           var target = ${JSON.stringify(target)};
           var norm = function(s) { return (s || '').toLowerCase().replace(/\\s+/g, ' ').trim(); };
-          var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr');
+          var rows = document.querySelectorAll('.zm-table__body-wrapper tbody tr, .zm-table__body tbody tr, table tbody tr');
           for (var i = 0; i < rows.length; i++) {
             var topicEl = rows[i].querySelector('button.topic-link, a.topic-link, td:first-child button, td:first-child a, td:first-child');
             var rowTopic = norm(topicEl ? topicEl.textContent : '');
@@ -1016,30 +986,7 @@ export class ZoomClient {
         return entry;
       }
 
-      const hasNext = await this.execInWindow<boolean>(`
-        (function() {
-          var btn = document.querySelector('button.btn-next');
-          return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
-        })()
-      `);
-      if (!hasNext) break;
-
-      const currentPage = await this.execInWindow<string | null>(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          return active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-        })()
-      `);
-
-      await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
-      await this.waitForCondition(`
-        (function() {
-          var active = document.querySelector('.zm-pager li.number.active');
-          var p = active ? (active.getAttribute('data-page') || active.textContent.trim()) : null;
-          return !!p && p !== ${JSON.stringify(currentPage)};
-        })()
-      `, 15000);
-      await new Promise((r) => setTimeout(r, 500));
+      if (!(await this.goToNextPage())) break;
     }
 
     return null;

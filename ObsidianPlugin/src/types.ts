@@ -114,6 +114,12 @@ export interface ZoomObsidianSettings {
    * Analytics & Reports page. Value looks like "VfmcPDweRYu1g6GgEEPq4g".
    */
   zoomAccountId: string;
+  /**
+   * Absolute path to the zoomObsidian repo checkout, used to run the
+   * browser-based login helper (zoom-login.mjs). Normally filled in
+   * automatically by ObsidianPlugin/install.sh; set it here to override.
+   */
+  cliPath: string;
 }
 
 export interface SerializedCookie {
@@ -137,6 +143,7 @@ export const DEFAULT_SETTINGS: ZoomObsidianSettings = {
   debug: false,
   sharedMeetingsFolder: "",
   zoomAccountId: "",
+  cliPath: "",
 };
 
 /** Per-source config file state (separate from data.json). */

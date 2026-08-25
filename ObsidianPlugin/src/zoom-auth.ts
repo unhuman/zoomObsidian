@@ -1,28 +1,39 @@
 /**
- * Zoom authentication via Electron BrowserWindow.
+ * Zoom authentication for the Obsidian plugin.
  *
- * Opens a BrowserWindow pointed at {subdomain}.zoom.us/signin for the user
- * to complete SSO / password login.  After login, cookies are extracted from
- * the BrowserWindow session and persisted via the plugin's saveData().
+ * Zoom SSO is fronted by Okta, which does not complete inside an embedded
+ * Electron BrowserWindow — the sign-in widget never advances past the Okta
+ * page, so no session is ever established. Opening the user's default browser
+ * doesn't help either: cookies set there live in that browser's jar and are
+ * unreachable from the plugin.
  *
- * On subsequent calls, stored cookies are tested with a lightweight HEAD
- * request — if still valid the BrowserWindow is skipped entirely.
+ * So the plugin drives the same Puppeteer-based flow the CLI uses. `login()`
+ * spawns `zoom-login.mjs` as a child process, which opens a real Chrome
+ * window, waits for SSO to complete, and writes the session cookies to
+ * ~/.zoom-mcp/cookies.json. The plugin then reads those cookies back. The user
+ * never leaves Obsidian and never touches a terminal.
+ *
+ * Stored cookies are tested with a lightweight HEAD request first — if the
+ * session is still valid, no browser opens at all.
  */
 
 import type { SerializedCookie } from "./types";
 import { notify } from "./types";
 import { nodeRequest } from "./node-http";
 
-// Electron is externalized by esbuild — available at runtime in Obsidian desktop
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-let BrowserWindow: any;
-let electronSession: any;
-try {
-  const electron = require("electron");
-  BrowserWindow = electron.remote?.BrowserWindow;
-  electronSession = electron.remote?.session;
-} catch (e) {
-  console.error("[zoom-auth] Failed to load Electron:", e);
+/** Where the CLI (and therefore this plugin) keeps the Zoom session. */
+function cookiesFilePath(): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const path = require("path");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const os = require("os");
+  return path.join(os.homedir(), ".zoom-mcp", "cookies.json");
+}
+
+/** Result of running the login helper. */
+interface SpawnResult {
+  code: number | null;
+  output: string;
 }
 
 export class ZoomAuth {
@@ -30,17 +41,21 @@ export class ZoomAuth {
   private cookies: SerializedCookie[];
   private persistCookies: (cookies: SerializedCookie[]) => Promise<void>;
   private debug: boolean;
+  /** Absolute path to the repo root containing zoom-login.mjs. */
+  private cliPath: string;
 
   constructor(opts: {
     subdomain: string;
     cookies: SerializedCookie[];
     persistCookies: (cookies: SerializedCookie[]) => Promise<void>;
     debug?: boolean;
+    cliPath?: string;
   }) {
     this.subdomain = opts.subdomain;
     this.cookies = opts.cookies;
     this.persistCookies = opts.persistCookies;
     this.debug = opts.debug ?? false;
+    this.cliPath = opts.cliPath ?? "";
   }
 
   get baseUrl(): string {
@@ -57,6 +72,19 @@ export class ZoomAuth {
   /** Replace in-memory cookies (e.g. after loadData). */
   setCookies(cookies: SerializedCookie[]): void {
     this.cookies = cookies;
+  }
+
+  /** Point the plugin at the repo checkout that holds zoom-login.mjs. */
+  setCliPath(cliPath: string): void {
+    this.cliPath = cliPath;
+  }
+
+  getCliPath(): string {
+    return this.cliPath;
+  }
+
+  setDebug(debug: boolean): void {
+    this.debug = debug;
   }
 
   private dbg(...args: unknown[]): void {
@@ -79,37 +107,79 @@ export class ZoomAuth {
     return [...this.cookies];
   }
 
-  /**
-   * Try to load cookies from CLI's shared location if plugin cookies are missing.
-   */
-  private async loadSharedCliCookies(): Promise<void> {
-    if (this.cookies.length > 0) return; // Already have cookies
+  // ── Cookie file (shared with the CLI) ──────────────────────
 
+  /** Read the cookie jar the CLI writes, or null if it isn't there. */
+  private readCookieFile(): SerializedCookie[] | null {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const fs = require("fs");
-      const path = require("path");
-      const os = require("os");
-
-      const cliCookiesPath = path.join(os.homedir(), ".zoom-mcp", "cookies.json");
-      if (fs.existsSync(cliCookiesPath)) {
-        const data = fs.readFileSync(cliCookiesPath, "utf-8");
-        const cliCookies = JSON.parse(data) as SerializedCookie[];
-        if (cliCookies.length > 0) {
-          this.dbg(`Loaded ${cliCookies.length} cookies from CLI at ${cliCookiesPath}`);
-          this.cookies = cliCookies;
-          await this.persistCookies(cliCookies);
-          notify("Using Zoom session from CLI authentication.");
-        }
-      }
+      const file = cookiesFilePath();
+      if (!fs.existsSync(file)) return null;
+      const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as Array<
+        SerializedCookie & { expires?: number; session?: boolean }
+      >;
+      if (!Array.isArray(parsed) || parsed.length === 0) return null;
+      // Puppeteer writes `expires` (epoch seconds, -1 for session cookies);
+      // Electron's cookies.set wants `expirationDate`. Without this mapping
+      // every restored cookie silently becomes a session cookie.
+      return parsed.map((c) => {
+        const { expires, session, ...rest } = c;
+        const expirationDate =
+          rest.expirationDate ??
+          (typeof expires === "number" && expires > 0 ? expires : undefined);
+        return expirationDate === undefined
+          ? (rest as SerializedCookie)
+          : ({ ...rest, expirationDate } as SerializedCookie);
+      });
     } catch (e) {
-      this.dbg("Could not load CLI cookies:", (e as Error).message);
+      this.dbg("Could not read cookie file:", (e as Error).message);
+      return null;
     }
   }
 
+  /**
+   * Adopt cookies written by the CLI whenever they differ from what we hold.
+   *
+   * Keying on the session cookie rather than on `this.cookies.length === 0`
+   * matters: a stale jar in data.json would otherwise permanently shadow a
+   * freshly written CLI session, so a successful re-login would have no effect.
+   */
+  private async loadSharedCliCookies(): Promise<void> {
+    const cliCookies = this.readCookieFile();
+    if (!cliCookies) return;
+
+    const sessionId = (cookies: SerializedCookie[]): string =>
+      cookies.find((c) => c.name === "_zm_ssid")?.value ?? "";
+
+    const incoming = sessionId(cliCookies);
+    if (this.cookies.length > 0 && incoming === sessionId(this.cookies)) return;
+
+    this.dbg(`Loaded ${cliCookies.length} cookies from ${cookiesFilePath()}`);
+    this.cookies = cliCookies;
+    await this.persistCookies(cliCookies);
+  }
+
+  /** Delete the shared cookie file (used before a forced re-login). */
+  private deleteCookieFile(): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require("fs");
+      const file = cookiesFilePath();
+      if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+        this.dbg("Deleted cookie file:", file);
+      }
+    } catch (e) {
+      this.dbg("Could not delete cookie file:", (e as Error).message);
+    }
+  }
+
+  // ── Session validation ─────────────────────────────────────
+
   /** Check whether stored cookies still grant access. */
   async isAuthenticated(): Promise<boolean> {
-    // First, try to load CLI cookies if we don't have any
+    // Pick up a session the CLI may have established.
     await this.loadSharedCliCookies();
 
     if (!this.cookies.length) return false;
@@ -160,235 +230,194 @@ export class ZoomAuth {
     return false;
   }
 
+  // ── Login (spawns the Puppeteer helper) ────────────────────
+
   /**
-   * Open a BrowserWindow for the user to complete Zoom login.
-   * Falls back to polling if BrowserWindow is not available.
-   * Resolves once the user has logged in and cookies are saved.
+   * Candidate Node binaries, most-likely-to-work first.
+   *
+   * Obsidian launched from Finder often has a minimal PATH that omits
+   * Homebrew/nvm, so a bare `node` can fail. Electron's own binary can run as
+   * plain Node via ELECTRON_RUN_AS_NODE, which is always present — that's the
+   * last-resort fallback.
    */
-  async login(): Promise<void> {
-    // If BrowserWindow is not available, use polling fallback
-    if (!BrowserWindow || !electronSession) {
-      return this.loginViaPolling();
+  private nodeCandidates(): Array<{ cmd: string; asNode: boolean }> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require("fs");
+    const candidates: Array<{ cmd: string; asNode: boolean }> = [];
+
+    for (const p of [
+      "/opt/homebrew/bin/node",
+      "/usr/local/bin/node",
+      "/usr/bin/node",
+    ]) {
+      try {
+        if (fs.existsSync(p)) candidates.push({ cmd: p, asNode: false });
+      } catch {
+        // Ignore probe failures and try the next path.
+      }
     }
 
-    // Delete any stale cookies before starting fresh login
-    await this.deleteCookies();
+    candidates.push({ cmd: "node", asNode: false });
+    candidates.push({ cmd: process.execPath, asNode: true });
+    return candidates;
+  }
 
-    return new Promise<void>((resolve, reject) => {
-      // Use a dedicated partition so Zoom cookies don't leak to or from the
-      // main Obsidian session
-      const partition = "persist:zoom-obsidian";
-      const ses = electronSession.fromPartition(partition);
+  /** Run one candidate binary against the login script. */
+  private runLoginScript(
+    cmd: string,
+    asNode: boolean,
+    scriptPath: string,
+    args: string[],
+    timeoutMs: number
+  ): Promise<SpawnResult> {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require("child_process");
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require("path");
 
-      // Pre-load all previously saved cookies into this session.
-      // This includes Okta session cookies which are essential for SSO to complete.
-      const loadPromises = this.cookies.map((c) =>
-        ses.cookies.set({
-          url: `https://${c.domain.replace(/^\./, "")}${c.path}`,
-          name: c.name,
-          value: c.value,
-          domain: c.domain,
-          path: c.path,
-          secure: c.secure,
-          httpOnly: c.httpOnly,
-          expirationDate: c.expirationDate,
-        }).catch((e) => {
-          this.dbg(`Failed to set cookie ${c.name} on domain ${c.domain}: ${(e as Error).message}`);
-        })
-      );
+    return new Promise<SpawnResult>((resolve, reject) => {
+      const env = { ...process.env };
+      if (asNode) env.ELECTRON_RUN_AS_NODE = "1";
+      else delete env.ELECTRON_RUN_AS_NODE;
 
-      Promise.all(loadPromises).then(() => {
-        const win = new BrowserWindow({
-          width: 1024,
-          height: 720,
-          title: "Zoom Login — Obsidian Plugin",
-          webPreferences: {
-            partition,
-            nodeIntegration: false,
-            contextIsolation: true,
-          },
-        });
+      const child = spawn(cmd, [scriptPath, ...args], {
+        cwd: path.dirname(scriptPath),
+        env,
+      });
 
-        const signinUrl = `${this.baseUrl}/signin`;
-        let loginDetected = false;
+      let output = "";
+      let settled = false;
 
-        // Detect successful login by URL change or page title
-        const checkUrl = () => {
-          if (loginDetected) return; // Already detected, ignore further checks
-          const url = win.webContents.getURL();
-          const title = win.getTitle();
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try {
+          child.kill();
+        } catch {
+          // Process may already be gone.
+        }
+        reject(new Error("Login timed out after 10 minutes"));
+      }, timeoutMs);
 
-          this.dbg(`[check] URL: ${url.split("?")[0]}, title: "${title}"`);
+      const capture = (buf: unknown) => {
+        const text = String(buf);
+        output += text;
+        for (const line of text.split("\n")) {
+          if (line.trim()) this.dbg("[login]", line.trim());
+        }
+      };
 
-          // Success condition 1: URL left auth paths (even if stuck at Okta, that's part of SSO flow)
-          const leftAuthPaths =
-            !url.includes("/signin") &&
-            !url.includes("/login") &&
-            !url.includes("/sso") &&
-            !url.includes("/auth") &&
-            !url.includes("samlredirect");
+      child.stdout?.on("data", capture);
+      child.stderr?.on("data", capture);
 
-          // Success condition 2: Page title changed from "Sign In" or "Cvent" (indicates authenticated page loaded)
-          const titleChanged = title &&
-            !title.includes("Sign In") &&
-            !title.includes("Cvent") &&
-            title.length > 5; // Avoid empty/placeholder titles
+      child.on("error", (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
 
-          // Success if EITHER:
-          // - We left auth paths AND are at a substantive page, OR
-          // - Page title changed (indicates we reached an authenticated page even if URL is at Okta)
-          const isSubstantivePage = url.length > (this.baseUrl.length + 10);
-          const success = (leftAuthPaths && isSubstantivePage) || titleChanged;
-
-          if (success) {
-            this.dbg("Login detected — URL:", url.split("?")[0], "title:", title);
-            loginDetected = true;
-            clearInterval(pollInterval);
-            extractCookies();
-          }
-        };
-
-        const extractCookies = async () => {
-          try {
-            // Navigate to a known Zoom page to ensure session is stable before extracting cookies
-            this.dbg("Navigating to Zoom profile page to stabilize session...");
-            await win.webContents.loadURL(`${this.baseUrl}/profile`);
-
-            // Wait briefly for profile page to fully load
-            await new Promise<void>((resolve) => {
-              setTimeout(() => resolve(), 1000);
-            });
-
-            const allCookies = await ses.cookies.get({});
-            // Save both Zoom and Okta cookies — Okta cookies are needed for SSO on next auth
-            const relevantCookies: SerializedCookie[] = allCookies
-              .filter((c: { domain: string }) => c.domain.includes("zoom.us") || c.domain.includes("okta.com"))
-              .map((c: { name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expirationDate?: number }) => ({
-                name: c.name,
-                value: c.value,
-                domain: c.domain,
-                path: c.path,
-                secure: c.secure,
-                httpOnly: c.httpOnly,
-                expirationDate: c.expirationDate,
-              }));
-            this.cookies = relevantCookies;
-            await this.persistCookies(relevantCookies);
-            notify("Zoom login successful — cookies saved.");
-            this.dbg("Saved", relevantCookies.length, "cookies (zoom.us + okta.com domains)");
-            win.close();
-            resolve();
-          } catch (e) {
-            reject(e);
-          }
-        };
-
-        // Listen for navigation events
-        win.webContents.on("did-navigate", checkUrl);
-        win.webContents.on("did-navigate-in-page", checkUrl);
-
-        // Also poll every 500ms in case the page changes without triggering navigation events
-        // (e.g., Zoom's SSO spinner staying on same URL)
-        const pollInterval = setInterval(checkUrl, 500);
-
-        // Timeout after 5 minutes
-        const loginTimeout = setTimeout(() => {
-          if (!loginDetected) {
-            this.dbg("Login timeout after 5 minutes");
-            clearInterval(pollInterval);
-            win.close();
-            reject(new Error("Login timeout — please try again"));
-          }
-        }, 300_000);
-
-        win.on("closed", () => {
-          clearInterval(pollInterval);
-          clearTimeout(loginTimeout);
-          // If the window is closed before login, just resolve silently
-          if (!loginDetected) {
-            resolve();
-          }
-        });
-
-        win.loadURL(signinUrl);
+      child.on("close", (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ code, output });
       });
     });
   }
 
   /**
-   * Fallback login: open system browser and poll for authentication.
-   * Called when BrowserWindow is not available.
+   * Authenticate by opening a real Chrome window via the Puppeteer helper.
+   *
+   * @param force Discard the existing session and sign in again.
    */
-  private async loginViaPolling(): Promise<void> {
-    const signinUrl = `${this.baseUrl}/signin`;
+  async login(force = false): Promise<void> {
+    if (!this.cliPath) {
+      throw new Error(
+        "Zoom CLI path is not set. Open plugin settings and set it to your " +
+        "zoomObsidian repo checkout (the folder containing zoom-login.mjs)."
+      );
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require("fs");
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require("path");
+
+    const scriptPath = path.join(this.cliPath, "zoom-login.mjs");
+    if (!fs.existsSync(scriptPath)) {
+      throw new Error(
+        `zoom-login.mjs not found at ${scriptPath}. Check the Zoom CLI path in plugin settings.`
+      );
+    }
+    if (!fs.existsSync(path.join(this.cliPath, "build", "zoom-browser.js"))) {
+      throw new Error(
+        `The CLI at ${this.cliPath} has not been built. Run "npm run build" there, then try again.`
+      );
+    }
+
+    if (force) this.deleteCookieFile();
+
+    const args: string[] = [];
+    if (this.subdomain) args.push("--subdomain", this.subdomain);
+    if (force) args.push("--force");
+
+    const progress = notify(
+      "Opening a browser window for Zoom sign-in. Complete the login there — Obsidian will continue automatically.",
+      0
+    );
 
     try {
-      console.log("[zoom-auth] loginViaPolling started");
-      this.dbg("loginViaPolling: attempting to open browser at", signinUrl);
+      let result: SpawnResult | null = null;
+      const spawnFailures: string[] = [];
 
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const electron = require("electron");
-      console.log("[zoom-auth] electron module loaded");
-
-      const shell = electron?.remote?.shell || electron?.shell;
-      if (!shell) {
-        console.error("[zoom-auth] shell module not found");
-        throw new Error("Cannot access system shell — unable to open browser");
-      }
-
-      notify("Opening Zoom login in your default browser. Please complete authentication, then return to Obsidian.");
-      console.log("[zoom-auth] About to open external URL:", signinUrl);
-
-      // Open in system browser
-      await shell.openExternal(signinUrl);
-      console.log("[zoom-auth] openExternal completed");
-
-      // Poll for authentication (check every 2 seconds for up to 10 minutes)
-      const maxAttempts = 300;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        await new Promise(r => setTimeout(r, 2000)); // Wait 2 seconds
-
-        const authed = await this.isAuthenticated();
-        if (authed) {
-          this.dbg("Polling detected successful authentication after", (attempt + 1) * 2, "seconds");
-          notify("Authentication detected — sync will proceed.");
-          return;
-        }
-
-        if (attempt % 30 === 0 && attempt > 0) {
-          this.dbg(`Still waiting for authentication (${attempt}/${maxAttempts} checks)...`);
+      for (const { cmd, asNode } of this.nodeCandidates()) {
+        try {
+          this.dbg("Launching login helper with:", cmd, asNode ? "(as node)" : "");
+          result = await this.runLoginScript(cmd, asNode, scriptPath, args, 600_000);
+          break;
+        } catch (e) {
+          const msg = (e as NodeJS.ErrnoException).code === "ENOENT"
+            ? `${cmd}: not found`
+            : `${cmd}: ${(e as Error).message}`;
+          this.dbg("Login helper launch failed —", msg);
+          spawnFailures.push(msg);
+          // A timeout is a real failure, not a missing binary — stop trying.
+          if ((e as Error).message.includes("timed out")) throw e;
         }
       }
 
-      throw new Error("Login timeout — authentication did not complete within 10 minutes");
-    } catch (e) {
-      throw new Error(`Login failed: ${(e as Error).message}`);
+      if (!result) {
+        throw new Error(
+          `Could not run Node.js to start the login helper. Tried: ${spawnFailures.join("; ")}`
+        );
+      }
+
+      if (result.code !== 0) {
+        const tail = result.output.trim().split("\n").slice(-3).join(" | ");
+        throw new Error(
+          `Login helper exited with code ${result.code}${tail ? ` — ${tail}` : ""}`
+        );
+      }
+
+      const cookies = this.readCookieFile();
+      if (!cookies) {
+        throw new Error("Login completed but no cookies were saved.");
+      }
+
+      this.cookies = cookies;
+      await this.persistCookies(cookies);
+      this.dbg("Saved", cookies.length, "cookies from login helper");
+    } finally {
+      progress.hide();
     }
   }
 
-  /** Delete the saved cookies file (used before fresh login). */
-  private async deleteCookies(): Promise<void> {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fs = require("fs");
-      const path = require("path");
-      const os = require("os");
-
-      const cliCookiesPath = path.join(os.homedir(), ".zoom-mcp", "cookies.json");
-      if (fs.existsSync(cliCookiesPath)) {
-        fs.unlinkSync(cliCookiesPath);
-        this.dbg("Deleted stale cookies file:", cliCookiesPath);
-      }
-    } catch (e) {
-      this.dbg("Could not delete cookies file:", (e as Error).message);
-    }
-  }
-
-  /** Clear stored cookies. */
+  /** Clear the stored session, both in the plugin and on disk. */
   async logout(): Promise<void> {
     this.cookies = [];
     await this.persistCookies([]);
-    await this.deleteCookies();
+    this.deleteCookieFile();
     notify("Zoom session cleared.");
   }
 }

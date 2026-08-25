@@ -4,6 +4,7 @@
 
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type ZoomObsidianPlugin from "./main";
+import { notify } from "./types";
 
 export class ZoomObsidianSettingTab extends PluginSettingTab {
   plugin: ZoomObsidianPlugin;
@@ -74,7 +75,12 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
         )
         .setCta()
         .onClick(async () => {
-          await this.plugin.auth.login();
+          try {
+            await this.plugin.auth.login(true);
+            notify("Zoom login successful.");
+          } catch (e) {
+            notify(`Zoom login failed: ${(e as Error).message}`);
+          }
           this.display(); // refresh to show updated status
         })
     );
@@ -190,6 +196,24 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
     // ── Advanced ─────────────────────────────────────────────
 
     containerEl.createEl("h3", { text: "Advanced" });
+
+    const activeCliPath = this.plugin.auth.getCliPath();
+    new Setting(containerEl)
+      .setName("Zoom CLI Path")
+      .setDesc(
+        "Folder containing zoom-login.mjs — used to open a real browser for Zoom sign-in. " +
+        "install.sh fills this in automatically; set it only to override. " +
+        (activeCliPath ? `Currently using: ${activeCliPath}` : "Not set — login is unavailable.")
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("/path/to/zoomObsidian")
+          .setValue(this.plugin.settings.cliPath)
+          .onChange(async (value) => {
+            this.plugin.settings.cliPath = value.trim();
+            await this.plugin.saveSettings();
+          })
+      );
 
     new Setting(containerEl)
       .setName("Debug Logging")

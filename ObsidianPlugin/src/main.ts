@@ -23,9 +23,18 @@ export default class ZoomObsidianPlugin extends Plugin {
   client!: ZoomClient;
   private writer!: VaultWriter;
 
+  /** Repo path written by install.sh; used when the setting is blank. */
+  private detectedCliPath = "";
+
+  /** Verbose console logging, gated on the Debug Logging setting. */
+  private dbg(...args: unknown[]): void {
+    if (this.settings?.debug) console.log("[zoom-obsidian]", ...args);
+  }
+
   async onload(): Promise<void> {
     await this.loadSettings();
     await this.loadConfigState();
+    await this.loadDetectedCliPath();
 
     this.auth = new ZoomAuth({
       subdomain: this.settings.zoomSubdomain,
@@ -35,6 +44,7 @@ export default class ZoomObsidianPlugin extends Plugin {
         await this.saveSettings();
       },
       debug: this.settings.debug,
+      cliPath: this.resolveCliPath(),
     });
 
     this.client = new ZoomClient(this.auth, {
@@ -102,12 +112,35 @@ export default class ZoomObsidianPlugin extends Plugin {
     );
   }
 
+  /**
+   * Read the repo path that install.sh drops next to the plugin, so login
+   * works without the user configuring anything.
+   */
+  async loadDetectedCliPath(): Promise<void> {
+    try {
+      const raw = await this.app.vault.adapter.read(
+        `${this.manifest.dir}/cli-path.json`
+      );
+      this.detectedCliPath = (JSON.parse(raw).cliPath as string) ?? "";
+    } catch {
+      // Not installed via install.sh — the setting is the only source.
+      this.detectedCliPath = "";
+    }
+  }
+
+  /** Explicit setting wins; otherwise fall back to what install.sh recorded. */
+  private resolveCliPath(): string {
+    return this.settings.cliPath.trim() || this.detectedCliPath;
+  }
+
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
     // Apply runtime changes
     if (this.auth) {
       this.auth.setSubdomain(this.settings.zoomSubdomain);
       this.auth.setCookies(this.settings.cookies);
+      this.auth.setDebug(this.settings.debug);
+      this.auth.setCliPath(this.resolveCliPath());
     }
     if (this.client) {
       this.client.setDebug(this.settings.debug);
@@ -174,16 +207,22 @@ export default class ZoomObsidianPlugin extends Plugin {
         return true;
       }
 
-      // Session expired — open login window
-      notify("Zoom session expired. Opening login window…");
+      // Session expired — sign in via the browser-based login helper.
       try {
         await this.auth.login();
-        notify("Login successful. Sync will now proceed.");
-        return true;
       } catch (e) {
-        notify(`Login failed: ${(e as Error).message}`);
+        notify(`Zoom login failed: ${(e as Error).message}`);
         return false;
       }
+
+      // Confirm the new session actually works before starting a sync.
+      if (await this.auth.isAuthenticated()) {
+        notify("Zoom login successful — continuing.");
+        return true;
+      }
+
+      notify("Zoom login finished but the session is still not valid. Please try again.");
+      return false;
     } catch (e) {
       checkNotice.hide();
       notify(`Authentication check failed: ${(e as Error).message}`);
@@ -193,7 +232,9 @@ export default class ZoomObsidianPlugin extends Plugin {
 
   private async doLogin(): Promise<void> {
     try {
-      await this.auth.login();
+      // Explicit login command — always start a fresh session.
+      await this.auth.login(true);
+      notify("Zoom login successful.");
     } catch (e) {
       notify(`Zoom login failed: ${(e as Error).message}`);
     }
