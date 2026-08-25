@@ -269,14 +269,25 @@ export class ZoomAuth {
     const signinUrl = `${this.baseUrl}/signin`;
 
     try {
+      console.log("[zoom-auth] loginViaPolling started");
+      this.dbg("loginViaPolling: attempting to open browser at", signinUrl);
+
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { shell } = require("electron").remote;
+      const electron = require("electron");
+      console.log("[zoom-auth] electron module loaded");
+
+      const shell = electron?.remote?.shell || electron?.shell;
+      if (!shell) {
+        console.error("[zoom-auth] shell module not found");
+        throw new Error("Cannot access system shell — unable to open browser");
+      }
 
       notify("Opening Zoom login in your default browser. Please complete authentication, then return to Obsidian.");
-      this.dbg("Opening browser:", signinUrl);
+      console.log("[zoom-auth] About to open external URL:", signinUrl);
 
       // Open in system browser
       await shell.openExternal(signinUrl);
+      console.log("[zoom-auth] openExternal completed");
 
       // Poll for authentication (check every 2 seconds for up to 10 minutes)
       const maxAttempts = 300;
