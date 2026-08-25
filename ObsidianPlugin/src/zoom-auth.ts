@@ -15,8 +15,15 @@ import { nodeRequest } from "./node-http";
 
 // Electron is externalized by esbuild — available at runtime in Obsidian desktop
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const electron = require("electron");
-const { BrowserWindow, session: electronSession } = electron.remote;
+let BrowserWindow: any;
+let electronSession: any;
+try {
+  const electron = require("electron");
+  BrowserWindow = electron.remote?.BrowserWindow;
+  electronSession = electron.remote?.session;
+} catch (e) {
+  console.error("[zoom-auth] Failed to load Electron:", e);
+}
 
 export class ZoomAuth {
   private subdomain: string;
@@ -124,9 +131,15 @@ export class ZoomAuth {
 
   /**
    * Open a BrowserWindow for the user to complete Zoom login.
+   * Falls back to polling if BrowserWindow is not available.
    * Resolves once the user has logged in and cookies are saved.
    */
   async login(): Promise<void> {
+    // If BrowserWindow is not available, use polling fallback
+    if (!BrowserWindow || !electronSession) {
+      return this.loginViaPolling();
+    }
+
     return new Promise<void>((resolve, reject) => {
       // Use a dedicated partition so Zoom cookies don't leak to or from the
       // main Obsidian session
@@ -246,6 +259,46 @@ export class ZoomAuth {
         win.loadURL(signinUrl);
       });
     });
+  }
+
+  /**
+   * Fallback login: open system browser and poll for authentication.
+   * Called when BrowserWindow is not available.
+   */
+  private async loginViaPolling(): Promise<void> {
+    const signinUrl = `${this.baseUrl}/signin`;
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { shell } = require("electron").remote;
+
+      notify("Opening Zoom login in your default browser. Please complete authentication, then return to Obsidian.");
+      this.dbg("Opening browser:", signinUrl);
+
+      // Open in system browser
+      await shell.openExternal(signinUrl);
+
+      // Poll for authentication (check every 2 seconds for up to 10 minutes)
+      const maxAttempts = 300;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        await new Promise(r => setTimeout(r, 2000)); // Wait 2 seconds
+
+        const authed = await this.isAuthenticated();
+        if (authed) {
+          this.dbg("Polling detected successful authentication after", (attempt + 1) * 2, "seconds");
+          notify("Authentication detected — sync will proceed.");
+          return;
+        }
+
+        if (attempt % 30 === 0 && attempt > 0) {
+          this.dbg(`Still waiting for authentication (${attempt}/${maxAttempts} checks)...`);
+        }
+      }
+
+      throw new Error("Login timeout — authentication did not complete within 10 minutes");
+    } catch (e) {
+      throw new Error(`Login failed: ${(e as Error).message}`);
+    }
   }
 
   /** Clear stored cookies. */

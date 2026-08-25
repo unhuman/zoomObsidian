@@ -1,6 +1,6 @@
 {
   "name": "zoom-meeting-summaries-mcp",
-  "version": "1.2.22",
+  "version": "1.2.23",
   "description": "MCP server for fetching Zoom meeting summaries via browser-based authentication",
   "type": "module",
   "main": "build/index.js",
