@@ -164,25 +164,28 @@ export default class ZoomObsidianPlugin extends Plugin {
    */
   private async ensureAuthenticated(): Promise<boolean> {
     const checkNotice = notify("Checking Zoom authentication…", 0);
-    const authed = await this.auth.isAuthenticated();
-    checkNotice.hide();
-    if (authed) return true;
 
-    // Session expired — open the login window automatically
-    notify("Zoom session expired — opening login window…");
     try {
-      await this.auth.login();
+      const authed = await this.auth.isAuthenticated();
+      checkNotice.hide();
+
+      if (authed) {
+        this.dbg("[auth] Session is valid");
+        return true;
+      }
+
+      // Session expired — show error and instructions
+      notify(
+        "Zoom session expired. Please run the CLI to authenticate:\n" +
+        "node zoom-meetings-to-obsidian.mjs\n\n" +
+        "Then return to Obsidian and try again."
+      );
+      return false;
     } catch (e) {
-      notify(`Zoom login failed: ${(e as Error).message}`);
+      checkNotice.hide();
+      notify(`Authentication check failed: ${(e as Error).message}`);
       return false;
     }
-
-    // Verify the login succeeded (user may have closed the window)
-    const authedAfterLogin = await this.auth.isAuthenticated();
-    if (!authedAfterLogin) {
-      notify("Zoom login was not completed. Please try again.");
-    }
-    return authedAfterLogin;
   }
 
   private async doLogin(): Promise<void> {
