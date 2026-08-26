@@ -24,6 +24,7 @@ import { nodeRequest, type SimpleResponse } from "./node-http";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const electron = require("electron");
 const { BrowserWindow: ElectronBrowserWindow, session: electronSession } = electron.remote;
+const ZOOM_SESSION_PARTITION = "persist:zoom-obsidian";
 
 /**
  * Condition for "the summary table has rendered", evaluated in the page.
@@ -106,6 +107,57 @@ export class ZoomClient {
     if (this.debug) console.log("[zoom-client]", ...args);
   }
 
+  private abortError(signal: AbortSignal): Error {
+    const reason = signal.reason as unknown;
+    if (reason instanceof Error) return reason;
+    if (reason) return new Error(String(reason));
+    return new Error("Operation cancelled.");
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw this.abortError(signal);
+  }
+
+  /** Await an Electron/Node promise while allowing the caller to stop waiting immediately. */
+  private async awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return promise;
+    this.throwIfAborted(signal);
+
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        cleanup();
+        reject(this.abortError(signal));
+      };
+      const cleanup = () => {
+        signal.removeEventListener("abort", onAbort);
+      };
+
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+
+      promise.then(
+        (value) => {
+          cleanup();
+          resolve(value);
+        },
+        (error) => {
+          cleanup();
+          reject(error);
+        }
+      );
+    });
+  }
+
+  private async delay(ms: number, signal?: AbortSignal): Promise<void> {
+    await this.awaitWithAbort(
+      new Promise<void>((resolve) => setTimeout(resolve, ms)),
+      signal
+    );
+  }
+
   /** Expose the in-memory nav-ID cache for diagnostics. */
   getNavCache(): Record<string, NavIdEntry> {
     return Object.fromEntries(this.navIdCache);
@@ -126,19 +178,22 @@ export class ZoomClient {
    * partition. Cookies are pre-loaded so the SPA receives an authenticated
    * session without user interaction.
    */
-  private async getOrCreateScrapeWindow(): Promise<InstanceType<typeof ElectronBrowserWindow>> {
+  private async getOrCreateScrapeWindow(
+    signal?: AbortSignal
+  ): Promise<InstanceType<typeof ElectronBrowserWindow>> {
+    this.throwIfAborted(signal);
     if (this.scrapeWin && !this.scrapeWin.isDestroyed()) {
       return this.scrapeWin;
     }
 
-    const partition = "persist:zoom-obsidian";
-    const ses = electronSession.fromPartition(partition);
+    const ses = electronSession.fromPartition(ZOOM_SESSION_PARTITION);
 
     // Pre-load cookies into the Electron session
     const cookies = this.auth.getSerializedCookies();
     for (const c of cookies) {
+      this.throwIfAborted(signal);
       try {
-        await ses.cookies.set({
+        await this.awaitWithAbort(ses.cookies.set({
           url: `https://${c.domain.replace(/^\./, "")}${c.path}`,
           name: c.name,
           value: c.value,
@@ -147,16 +202,21 @@ export class ZoomClient {
           secure: c.secure,
           httpOnly: c.httpOnly,
           expirationDate: c.expirationDate,
-        });
-      } catch { /* ignore individual cookie failures */ }
+        }), signal);
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        // Ignore individual cookie failures.
+      }
     }
+
+    this.throwIfAborted(signal);
 
     this.scrapeWin = new ElectronBrowserWindow({
       show: false,
       width: 1280,
       height: 900,
       webPreferences: {
-        partition,
+        partition: ZOOM_SESSION_PARTITION,
         nodeIntegration: false,
         contextIsolation: true,
       },
@@ -173,6 +233,17 @@ export class ZoomClient {
     this.scrapeWin = null;
   }
 
+  /** Clear the persistent Electron session used by the SPA and all related caches. */
+  async clearSession(): Promise<void> {
+    this.closeScrapeWindow();
+    this.navIdCache.clear();
+    this._detectedMyName = "";
+
+    const ses = electronSession.fromPartition(ZOOM_SESSION_PARTITION);
+    await ses.clearStorageData();
+    await ses.clearCache();
+  }
+
   /**
    * Open a VISIBLE BrowserWindow pointed at the meeting summary SPA and
    * return a diagnostic report of what DOM structure is present.
@@ -182,7 +253,7 @@ export class ZoomClient {
    * class names from the tables so you can update the selectors.
    */
   async diagnoseSpa(): Promise<string> {
-    const partition = "persist:zoom-obsidian";
+    const partition = ZOOM_SESSION_PARTITION;
     const ses = electronSession.fromPartition(partition);
 
     // Pre-load cookies
@@ -370,17 +441,19 @@ export class ZoomClient {
    * stuck on page 2 after pagination). Force a hard reload in that case
    * so the SPA resets to its initial state.
    */
-  private async navigateScrapeWindow(url: string): Promise<void> {
-    const win = await this.getOrCreateScrapeWindow();
+  private async navigateScrapeWindow(url: string, signal?: AbortSignal): Promise<void> {
+    this.throwIfAborted(signal);
+    const win = await this.getOrCreateScrapeWindow(signal);
     const currentUrl = win.webContents.getURL();
     if (currentUrl === url) {
       // Same URL — force a hard reload to reset SPA state
-      win.webContents.reload();
-      await new Promise<void>((resolve) => {
+      const loadFinished = new Promise<void>((resolve) => {
         win.webContents.once("did-finish-load", resolve);
       });
+      win.webContents.reload();
+      await this.awaitWithAbort(loadFinished, signal);
     } else {
-      await win.loadURL(url);
+      await this.awaitWithAbort(win.loadURL(url), signal);
     }
   }
 
@@ -396,24 +469,24 @@ export class ZoomClient {
    * (treated as "no more pages" rather than retried). The page turn is
    * detected from the rendered rows, not from Zoom's pager markup.
    */
-  private async goToNextPage(): Promise<boolean> {
+  private async goToNextPage(signal?: AbortSignal): Promise<boolean> {
     const hasNext = await this.execInWindow<boolean>(`
       (function() {
         var btn = document.querySelector('button.btn-next');
         return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
       })()
-    `);
+    `, signal);
     if (!hasNext) return false;
 
-    const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS);
-    await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`);
+    const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS, signal);
+    await this.execInWindow<void>(`document.querySelector('button.btn-next').click()`, signal);
 
     const changed = await this.waitForCondition(`
       (function() {
         var fp = ${ROW_FINGERPRINT_JS};
         return fp !== '' && fp !== ${JSON.stringify(fingerprint)};
       })()
-    `, 15000);
+    `, 15000, signal);
 
     if (!changed) {
       this.dbg("[pagination] Rows did not change after clicking next — stopping");
@@ -421,7 +494,7 @@ export class ZoomClient {
     }
 
     // Brief settle for Vue reactivity
-    await new Promise((r) => setTimeout(r, 500));
+    await this.delay(500, signal);
     return true;
   }
 
@@ -432,34 +505,35 @@ export class ZoomClient {
    * that selector had gone stale, which made this a silent no-op and left the
    * window on whatever page a previous scan ended on.
    */
-  private async resetToFirstPage(): Promise<void> {
+  private async resetToFirstPage(signal?: AbortSignal): Promise<void> {
     let safety = 20;
     let moved = false;
 
     while (safety-- > 0) {
+      this.throwIfAborted(signal);
       const hasPrev = await this.execInWindow<boolean>(`
         (function() {
           var btn = document.querySelector('button.btn-prev');
           return !!btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true';
         })()
-      `);
+      `, signal);
       if (!hasPrev) break;
 
-      const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS);
-      await this.execInWindow<void>(`document.querySelector('button.btn-prev').click()`);
+      const fingerprint = await this.execInWindow<string>(ROW_FINGERPRINT_JS, signal);
+      await this.execInWindow<void>(`document.querySelector('button.btn-prev').click()`, signal);
 
       const changed = await this.waitForCondition(`
         (function() {
           var fp = ${ROW_FINGERPRINT_JS};
           return fp !== '' && fp !== ${JSON.stringify(fingerprint)};
         })()
-      `, 10000);
+      `, 10000, signal);
       if (!changed) break;
       moved = true;
     }
 
     if (moved) {
-      await new Promise((r) => setTimeout(r, 300));
+      await this.delay(300, signal);
       this.dbg("[resetToFirstPage] Rewound to page 1.");
     }
   }
@@ -467,21 +541,30 @@ export class ZoomClient {
   /**
    * Execute JavaScript in the hidden window's page context.
    */
-  private async execInWindow<T>(code: string): Promise<T> {
-    const win = await this.getOrCreateScrapeWindow();
-    return win.webContents.executeJavaScript(code) as Promise<T>;
+  private async execInWindow<T>(code: string, signal?: AbortSignal): Promise<T> {
+    this.throwIfAborted(signal);
+    const win = await this.getOrCreateScrapeWindow(signal);
+    return this.awaitWithAbort(
+      win.webContents.executeJavaScript(code) as Promise<T>,
+      signal
+    );
   }
 
   /**
    * Poll the SPA until a condition is met or timeout expires.
    * `conditionCode` should be a JS expression that returns a truthy value when ready.
    */
-  private async waitForCondition(conditionCode: string, timeoutMs = 15000): Promise<boolean> {
+  private async waitForCondition(
+    conditionCode: string,
+    timeoutMs = 15000,
+    signal?: AbortSignal
+  ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const ready = await this.execInWindow<boolean>(conditionCode);
+      this.throwIfAborted(signal);
+      const ready = await this.execInWindow<boolean>(conditionCode, signal);
       if (ready) return true;
-      await new Promise((r) => setTimeout(r, 300));
+      await this.delay(300, signal);
     }
     return false;
   }
@@ -494,8 +577,14 @@ export class ZoomClient {
    */
   private async zoomFetch(
     url: string,
-    init: { method?: string; headers?: Record<string, string>; body?: string } = {}
+    init: {
+      method?: string;
+      headers?: Record<string, string>;
+      body?: string;
+      signal?: AbortSignal;
+    } = {}
   ): Promise<SimpleResponse> {
+    this.throwIfAborted(init.signal);
     const headers: Record<string, string> = { ...(init.headers ?? {}) };
     headers["Cookie"] = this.auth.getCookieHeader();
     if (!headers["Accept"]) headers["Accept"] = "text/html, application/json";
@@ -505,6 +594,7 @@ export class ZoomClient {
       headers,
       body: init.body,
       followRedirects: false,
+      signal: init.signal,
     });
 
     // Zoom redirects to /signin on expired session
@@ -525,8 +615,8 @@ export class ZoomClient {
    * Fetch a page's HTML and parse it into a DOM Document using DOMParser
    * (available in Obsidian's Electron renderer).
    */
-  private async fetchDom(url: string): Promise<Document> {
-    const res = await this.zoomFetch(url);
+  private async fetchDom(url: string, signal?: AbortSignal): Promise<Document> {
+    const res = await this.zoomFetch(url, { signal });
     const parser = new DOMParser();
     return parser.parseFromString(res.body, "text/html");
   }
@@ -567,8 +657,10 @@ export class ZoomClient {
    */
   async listSummaries(
     sourceType: 'owned' | 'shared' = 'owned',
-    options: { from?: string; to?: string } = {}
+    options: { from?: string; to?: string; signal?: AbortSignal } = {}
   ): Promise<MeetingSummaryItem[]> {
+    const { signal } = options;
+    this.throwIfAborted(signal);
     const baseUrl = this.auth.baseUrl;
     const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
     let url = `${baseUrl}/user/meeting/summary#/${hashFragment}`;
@@ -580,20 +672,20 @@ export class ZoomClient {
     }
 
     this.dbg("Navigating scrape window to:", url);
-    await this.navigateScrapeWindow(url);
+    await this.navigateScrapeWindow(url, signal);
 
     // Defensive: some loads land on the default list route even when a hash was supplied.
     // Force the intended route and give the SPA time to react.
     const expectedHash = sourceType === "shared" ? "#/summaryShare" : "#/list";
-    const currentHash = await this.execInWindow<string>("window.location.hash || ''");
+    const currentHash = await this.execInWindow<string>("window.location.hash || ''", signal);
     if (!currentHash.startsWith(expectedHash)) {
       this.dbg(`Route mismatch after load (have "${currentHash}", want "${expectedHash}"). Forcing hash.`);
-      await this.execInWindow<void>(`window.location.hash = ${JSON.stringify(expectedHash)}`);
-      await new Promise((r) => setTimeout(r, 800));
+      await this.execInWindow<void>(`window.location.hash = ${JSON.stringify(expectedHash)}`, signal);
+      await this.delay(800, signal);
     }
 
     // Wait for the SPA table to render
-    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000);
+    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000, signal);
 
     // A timeout here is not fatal: scrapeRowsCode falls back to
     // `table:last-of-type`, which still finds the rows when Zoom's markup has
@@ -612,7 +704,7 @@ export class ZoomClient {
           var text = (main.textContent || '').trim().substring(0, 2000);
           return JSON.stringify({ hash: hash, href: href, tables: tables, rows: rows, text: text });
         })()
-      `);
+      `, signal);
       this.dbg("Page diagnostics:", pageInfo);
     }
 
@@ -661,14 +753,15 @@ export class ZoomClient {
     const MAX_PAGES = 100; // safety limit, matching the CLI
     let pageCount = 0;
     while (pageCount < MAX_PAGES) {
+      this.throwIfAborted(signal);
       pageCount++;
-      const rows = await this.execInWindow<MeetingSummaryItem[]>(scrapeRowsCode);
+      const rows = await this.execInWindow<MeetingSummaryItem[]>(scrapeRowsCode, signal);
       this.dbg(`Scraped ${rows.length} rows from page ${pageCount}`);
       allSummaries.push(...rows);
 
       // Pagination is markup-fragile, so it lives in one place — see
       // goToNextPage(). The pager-based version stopped after page 1.
-      if (!(await this.goToNextPage())) break;
+      if (!(await this.goToNextPage(signal))) break;
     }
     if (pageCount >= MAX_PAGES) {
       this.dbg(`[WARN] Pagination hit the ${MAX_PAGES}-page cap — results may be truncated`);
@@ -690,8 +783,10 @@ export class ZoomClient {
   async resolveNavId(
     numericId: string,
     sourceType: 'owned' | 'shared' = 'owned',
-    dateHint?: string
+    dateHint?: string,
+    signal?: AbortSignal
   ): Promise<NavIdEntry | null> {
+    this.throwIfAborted(signal);
     const cacheKey = this.navCacheKey(numericId, sourceType, dateHint);
     const cached = this.navIdCache.get(cacheKey);
     if (cached) {
@@ -702,18 +797,25 @@ export class ZoomClient {
 
     const baseUrl = this.auth.baseUrl;
     const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
-    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`, signal);
 
     // Wait for SPA table
-    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000);
-    console.log(`[zoom-client][resolveNavId] tableReady=${tableReady} id=${numericId} hash=${await this.execInWindow<string>(`window.location.hash`).catch(()=>'?')}`);
+    const tableReady = await this.waitForCondition(TABLE_READY_JS, 15000, signal);
+    let currentHash = "?";
+    try {
+      currentHash = await this.execInWindow<string>(`window.location.hash`, signal);
+    } catch (e) {
+      if (signal?.aborted) throw e;
+    }
+    console.log(`[zoom-client][resolveNavId] tableReady=${tableReady} id=${numericId} hash=${currentHash}`);
     // Not fatal — the row-matching below queries the DOM directly, so let it
     // try rather than reporting "not found" for a page that did render.
 
     // Reset to page 1 — the SPA may still be on a later page from a prior scan
-    await this.resetToFirstPage();
+    await this.resetToFirstPage(signal);
 
     while (true) {
+      this.throwIfAborted(signal);
       // Try to find and click the row (with optional dateHint to pick the right recurring instance)
       const clickResult = await this.execInWindow<{ found: boolean; candidateCount: number; matchedDate: boolean; clickedRowText: string }>(`
         (function() {
@@ -757,7 +859,7 @@ export class ZoomClient {
           if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           return { found: true, candidateCount: candidates.length, matchedDate: matchedDate, clickedRowText: clickedText };
         })()
-      `);
+      `, signal);
       const found = clickResult.found;
       console.log(`[zoom-client][resolveNavId] id=${numericId} found=${found} candidates=${clickResult.candidateCount} clickedRow="${clickResult.clickedRowText.substring(0,60)}"`);
 
@@ -777,7 +879,7 @@ export class ZoomClient {
             }
             return out;
           })()
-        `);
+        `, signal);
         this.dbg(`[resolveNavId] Row NOT found for ${numericId} on this page. First rows: ${JSON.stringify(rowDump)}`);
       }
 
@@ -785,9 +887,10 @@ export class ZoomClient {
         // Both owned and shared navigate to #/detail (shared adds isShared=true)
         const hashChanged = await this.waitForCondition(
           `window.location.hash.startsWith('#/detail')`,
-          10000
+          10000,
+          signal
         );
-        const finalHash = await this.execInWindow<string>(`window.location.hash`);
+        const finalHash = await this.execInWindow<string>(`window.location.hash`, signal);
         console.log(`[zoom-client][resolveNavId] hashChanged=${hashChanged} finalHash="${finalHash.substring(0,80)}"`);
 
         if (hashChanged) {
@@ -808,7 +911,7 @@ export class ZoomClient {
 
       // Check for next page
       this.dbg(`[resolveNavId] id=${numericId} not found on current page, checking pagination...`);
-      if (!(await this.goToNextPage())) break;
+      if (!(await this.goToNextPage(signal))) break;
     }
 
     return null;
@@ -822,8 +925,10 @@ export class ZoomClient {
    */
   async prefetchNavIds(
     numericIds: string[],
-    sourceType: 'owned' | 'shared' = 'owned'
+    sourceType: 'owned' | 'shared' = 'owned',
+    signal?: AbortSignal
   ): Promise<void> {
+    this.throwIfAborted(signal);
     const needed = new Set(
       numericIds.filter((id) => !this.navIdCache.has(this.navCacheKey(id, sourceType)))
     );
@@ -832,17 +937,18 @@ export class ZoomClient {
     this.dbg(`Pre-fetching nav IDs for ${needed.size} meetings`);
     const baseUrl = this.auth.baseUrl;
     const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
-    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`, signal);
 
     // Wait for SPA table
-    await this.waitForCondition(TABLE_READY_JS, 15000);
+    await this.waitForCondition(TABLE_READY_JS, 15000, signal);
 
     // Reset to page 1 in case the SPA stayed on a later page
-    await this.resetToFirstPage();
+    await this.resetToFirstPage(signal);
 
     let currentPageNum = 1;
 
     while (needed.size > 0) {
+      this.throwIfAborted(signal);
       // Find which needed IDs are on this page
       const neededArr = [...needed];
       const pageIds = await this.execInWindow<string[]>(`
@@ -861,11 +967,12 @@ export class ZoomClient {
           }
           return found;
         })()
-      `);
+      `, signal);
 
       this.dbg(`Page ${currentPageNum}: found ${pageIds.length} needed rows`);
 
       for (const numericId of pageIds) {
+        this.throwIfAborted(signal);
         // Click the row
         const clicked = await this.execInWindow<boolean>(`
           (function() {
@@ -886,16 +993,17 @@ export class ZoomClient {
             }
             return false;
           })()
-        `);
+        `, signal);
         if (!clicked) continue;
 
         // Wait for hash to change to #/detail
         const hashChanged = await this.waitForCondition(
           `window.location.hash.startsWith('#/detail')`,
-          10000
+          10000,
+          signal
         );
         if (hashChanged) {
-          const hash = await this.execInWindow<string>(`window.location.hash`);
+          const hash = await this.execInWindow<string>(`window.location.hash`, signal);
           const entry = this.parseDetailHash(hash);
           if (entry) {
             if (sourceType === 'shared') entry.isShared = true;
@@ -906,16 +1014,16 @@ export class ZoomClient {
         }
 
         // Navigate back to list
-        await this.execInWindow<void>(`window.location.hash = '#/${hashFragment}'`);
-        await this.waitForCondition(TABLE_READY_JS, 10000);
+        await this.execInWindow<void>(`window.location.hash = '#/${hashFragment}'`, signal);
+        await this.waitForCondition(TABLE_READY_JS, 10000, signal);
 
         // Returning to the list resets it to page 1, so walk forward again.
         // Previously this asked the pager which page it was on; that selector
         // had gone stale, so it fell back to blind timed clicks.
         if (currentPageNum > 1) {
-          await this.resetToFirstPage();
+          await this.resetToFirstPage(signal);
           for (let p = 1; p < currentPageNum; p++) {
-            if (!(await this.goToNextPage())) {
+            if (!(await this.goToNextPage(signal))) {
               this.dbg(`Could not return to page ${currentPageNum} (stopped at ${p})`);
               break;
             }
@@ -924,7 +1032,7 @@ export class ZoomClient {
       }
 
       // Move to next page
-      if (!(await this.goToNextPage())) break;
+      if (!(await this.goToNextPage(signal))) break;
       currentPageNum++;
     }
 
@@ -937,22 +1045,25 @@ export class ZoomClient {
    */
   private async resolveNavIdByTopic(
     topicHint: string,
-    sourceType: 'owned' | 'shared' = 'owned'
+    sourceType: 'owned' | 'shared' = 'owned',
+    signal?: AbortSignal
   ): Promise<NavIdEntry | null> {
+    this.throwIfAborted(signal);
     const target = this.normalizeTopic(topicHint);
     if (!target) return null;
 
     const baseUrl = this.auth.baseUrl;
     const hashFragment = sourceType === 'shared' ? 'summaryShare' : 'list';
-    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`);
+    await this.navigateScrapeWindow(`${baseUrl}/user/meeting/summary#/${hashFragment}`, signal);
 
     // A timeout is not fatal — the row match below queries the DOM directly.
-    await this.waitForCondition(TABLE_READY_JS, 15000);
+    await this.waitForCondition(TABLE_READY_JS, 15000, signal);
 
     // Reset to page 1 in case the SPA stayed on a later page
-    await this.resetToFirstPage();
+    await this.resetToFirstPage(signal);
 
     while (true) {
+      this.throwIfAborted(signal);
       const matchAndClick = await this.execInWindow<boolean>(`
         (function() {
           var target = ${JSON.stringify(target)};
@@ -968,25 +1079,26 @@ export class ZoomClient {
           }
           return false;
         })()
-      `);
+      `, signal);
 
       if (matchAndClick) {
         this.dbg(`[resolveNavIdByTopic] Row matched for "${topicHint}" (${sourceType}), waiting for #/detail...`);
         const navigated = await this.waitForCondition(
           `window.location.hash.startsWith('#/detail')`,
-          10000
+          10000,
+          signal
         );
-        const finalHash = await this.execInWindow<string>(`window.location.hash`);
+        const finalHash = await this.execInWindow<string>(`window.location.hash`, signal);
         this.dbg(`[resolveNavIdByTopic] navigated=${navigated} hash="${finalHash}"`);
         if (!navigated) return null;
 
-        const hash = await this.execInWindow<string>(`window.location.hash`);
+        const hash = await this.execInWindow<string>(`window.location.hash`, signal);
         const entry = this.parseDetailHash(hash);
         if (entry && sourceType === 'shared') entry.isShared = true;
         return entry;
       }
 
-      if (!(await this.goToNextPage())) break;
+      if (!(await this.goToNextPage(signal))) break;
     }
 
     return null;
@@ -1081,8 +1193,10 @@ export class ZoomClient {
     meetingId: string,
     sourceType: 'owned' | 'shared' = 'owned',
     topicHint?: string,
-    dateHint?: string
+    dateHint?: string,
+    signal?: AbortSignal
   ): Promise<MeetingSummaryDetail> {
+    this.throwIfAborted(signal);
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
     const cacheKey = this.navCacheKey(numericId, sourceType, dateHint);
@@ -1091,10 +1205,10 @@ export class ZoomClient {
     let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
       this.dbg(`[getSummary] No cached navEntry for ${numericId} (${sourceType}) dateHint=${dateHint}. Resolving by ID...`);
-      navEntry = (await this.resolveNavId(numericId, sourceType, dateHint)) ?? undefined;
+      navEntry = (await this.resolveNavId(numericId, sourceType, dateHint, signal)) ?? undefined;
       if (!navEntry && topicHint) {
         this.dbg(`[getSummary] resolveNavId by numeric ID failed for ${numericId}; retrying by topic: ${topicHint}`);
-        navEntry = (await this.resolveNavIdByTopic(topicHint, sourceType)) ?? undefined;
+        navEntry = (await this.resolveNavIdByTopic(topicHint, sourceType, signal)) ?? undefined;
         if (navEntry) {
           if (sourceType === 'shared') navEntry.isShared = true;
           this.navIdCache.set(cacheKey, navEntry);
@@ -1124,13 +1238,15 @@ export class ZoomClient {
           credentials: 'include',
           headers: { 'Accept': 'application/json' }
         }).then(function(r) { return r.json(); })
-      `);
+      `, signal);
       this.dbg(`[getSummary] In-browser fetch result: status=${apiResponse?.status} hasResult=${!!apiResponse?.result} keys=${apiResponse?.result ? Object.keys(apiResponse.result).join(',') : 'none'}`);
     } catch (browserFetchErr) {
+      if (signal?.aborted) throw browserFetchErr;
       this.dbg(`[getSummary] In-browser fetch failed (${(browserFetchErr as Error).message}), falling back to nodeRequest...`);
       // Fallback to nodeRequest
       const res = await this.zoomFetch(apiUrl, {
         headers: { Accept: "application/json" },
+        signal,
       });
       this.dbg(`[getSummary] nodeRequest status=${res.status} bodyLen=${res.body.length}`);
       if (this.debug) {
@@ -1190,14 +1306,16 @@ export class ZoomClient {
    */
   async getMeetingParticipants(
     meetingId: string,
-    sourceType: 'owned' | 'shared' = 'owned'
+    sourceType: 'owned' | 'shared' = 'owned',
+    signal?: AbortSignal
   ): Promise<string[]> {
+    this.throwIfAborted(signal);
     const numericId = meetingId.replace(/[\s-]/g, "");
     const cacheKey = this.navCacheKey(numericId, sourceType);
     let navEntry = this.navIdCache.get(cacheKey);
     if (!navEntry) {
       this.dbg(`[getParticipants] No cached navEntry for ${numericId}; resolving now`);
-      navEntry = (await this.resolveNavId(numericId, sourceType)) ?? undefined;
+      navEntry = (await this.resolveNavId(numericId, sourceType, undefined, signal)) ?? undefined;
       if (!navEntry) {
         this.dbg(`[getParticipants] Could not resolve navId for ${numericId}`);
         return [];
@@ -1208,10 +1326,10 @@ export class ZoomClient {
     const url = `${this.auth.baseUrl}/rest/account/report/historymeetings/participants/list`;
     this.dbg(`[getParticipants] ${numericId} uuid=${uuidMeetingId}`);
 
-    const win = await this.getOrCreateScrapeWindow();
+    const win = await this.getOrCreateScrapeWindow(signal);
     let raw: { accountId: string; storeKeys: string; body: unknown };
     try {
-      raw = await win.webContents.executeJavaScript(`
+      raw = await this.awaitWithAbort(win.webContents.executeJavaScript(`
         (async function() {
           // Extract accountId from the SPA's Vuex store — search all modules
           let accountId = ${JSON.stringify(this._accountId ?? '')};
@@ -1268,8 +1386,9 @@ export class ZoomClient {
           const body = await resp.json();
           return { accountId, storeKeys, body };
         })()
-      `);
+      `), signal);
     } catch (e) {
+      if (signal?.aborted) throw e;
       this.dbg(`[getParticipants] Fetch error for ${numericId}: ${(e as Error).message}`);
       return [];
     }
@@ -1314,8 +1433,10 @@ export class ZoomClient {
    * 4. Fallback: run fetch() inside the browser context (has session cookies + CSRF)
    */
   async deleteSummary(
-    meetingId: string
+    meetingId: string,
+    signal?: AbortSignal
   ): Promise<{ success: boolean; message: string }> {
+    this.throwIfAborted(signal);
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
     const cacheKey = this.navCacheKey(numericId, 'owned');
@@ -1323,7 +1444,7 @@ export class ZoomClient {
 
     let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
-      navEntry = (await this.resolveNavId(numericId, 'owned')) ?? undefined;
+      navEntry = (await this.resolveNavId(numericId, 'owned', undefined, signal)) ?? undefined;
       console.log(`[zoom-client][delete] resolveNavId result: ${navEntry ? `meetingId=${navEntry.uuidMeetingId}` : "null (not found)"}`);
       if (!navEntry) {
         return {
@@ -1341,13 +1462,16 @@ export class ZoomClient {
     // If resolveNavId already navigated to this detail page via an in-page click,
     // skip the loadURL() call — a cold reload is slower and less reliable than the
     // in-page hash navigation that resolveNavId uses.
-    const currentHash = await this.execInWindow<string>(`window.location.hash`).catch(() => "");
+    const currentHash = await this.execInWindow<string>(`window.location.hash`, signal).catch((e) => {
+      if (signal?.aborted) throw e;
+      return "";
+    });
     const alreadyOnDetail = currentHash.startsWith("#/detail") && currentHash.includes(encodeURIComponent(uuidMeetingId));
     console.log(`[zoom-client][delete] currentHash=${currentHash} alreadyOnDetail=${alreadyOnDetail}`);
     if (!alreadyOnDetail) {
       console.log(`[zoom-client][delete] Navigating to detail: ${detailUrl}`);
-      await this.navigateScrapeWindow(detailUrl);
-      await this.waitForCondition(`window.location.hash.startsWith("#/detail")`, 5000);
+      await this.navigateScrapeWindow(detailUrl, signal);
+      await this.waitForCondition(`window.location.hash.startsWith("#/detail")`, 5000, signal);
     } else {
       console.log(`[zoom-client][delete] Already on detail page, skipping reload`);
     }
@@ -1368,7 +1492,7 @@ export class ZoomClient {
         return false;
       })()
     `;
-    const deleteButtonReady = await this.waitForCondition(deleteButtonCondition, 15000);
+    const deleteButtonReady = await this.waitForCondition(deleteButtonCondition, 15000, signal);
     console.log(`[zoom-client][delete] deleteButtonReady=${deleteButtonReady}`);
 
     if (!deleteButtonReady) {
@@ -1384,13 +1508,22 @@ export class ZoomClient {
           }
           return out.join('\\n') || '(no buttons found)';
         })()
-      `).catch(() => "(error dumping buttons)");
+      `, signal).catch((e) => {
+        if (signal?.aborted) throw e;
+        return "(error dumping buttons)";
+      });
       this.dbg(`[delete] Delete button not found. Page buttons:\n${btnDump}`);
-      this.dbg(`[delete] Current hash: `, await this.execInWindow<string>(`window.location.hash`).catch(() => "?"));
+      let debugHash = "?";
+      try {
+        debugHash = await this.execInWindow<string>(`window.location.hash`, signal);
+      } catch (e) {
+        if (signal?.aborted) throw e;
+      }
+      this.dbg(`[delete] Current hash: `, debugHash);
 
       // Maybe stale cache — evict and re-resolve
       this.navIdCache.delete(cacheKey);
-      const retryNav = await this.resolveNavId(numericId, 'owned');
+      const retryNav = await this.resolveNavId(numericId, 'owned', undefined, signal);
       if (!retryNav) {
         return {
           success: true,
@@ -1399,8 +1532,8 @@ export class ZoomClient {
       }
       // Navigate to the fresh detail URL
       const retryUrl = `${baseUrl}/user/meeting/summary#/detail?meetingId=${encodeURIComponent(retryNav.uuidMeetingId)}&summaryId=${encodeURIComponent(retryNav.summaryId)}`;
-      await this.navigateScrapeWindow(retryUrl);
-      const retryReady = await this.waitForCondition(deleteButtonCondition, 15000);
+      await this.navigateScrapeWindow(retryUrl, signal);
+      const retryReady = await this.waitForCondition(deleteButtonCondition, 15000, signal);
       if (!retryReady) {
         return {
           success: false,
@@ -1424,7 +1557,7 @@ export class ZoomClient {
         if (deleteEl) { deleteEl.click(); return "clicked: " + deleteEl.textContent?.trim(); }
         return null;
       })()
-    `);
+    `, signal);
     this.dbg(`[delete] Click result: ${clicked ?? "NO BUTTON FOUND"}`);
 
     if (!clicked) {
@@ -1440,10 +1573,10 @@ export class ZoomClient {
           if (moreEl) { moreEl.click(); return true; }
           return false;
         })()
-      `);
+      `, signal);
 
       if (menuOpened) {
-        await new Promise((r) => setTimeout(r, 500));
+        await this.delay(500, signal);
         await this.execInWindow<boolean>(`
           (() => {
             const allEls = Array.from(document.querySelectorAll(
@@ -1457,19 +1590,20 @@ export class ZoomClient {
             if (deleteEl) { deleteEl.click(); return true; }
             return false;
           })()
-        `);
+        `, signal);
       }
     }
 
     // Wait for the "Move to Trash" confirmation dialog.
     // Give the dialog time to animate in after the delete click.
-    await new Promise((r) => setTimeout(r, 600));
+    await this.delay(600, signal);
     const confirmReady = await this.waitForCondition(
       `Array.from(document.querySelectorAll("button")).some(function(e) {
         var txt = (e.textContent || '').trim().toLowerCase();
         return txt === "move to trash";
       })`,
-      4000
+      4000,
+      signal
     );
 
     let uiDeleteSucceeded = false;
@@ -1486,7 +1620,7 @@ export class ZoomClient {
           if (confirmEl) { confirmEl.click(); return confirmEl.textContent?.trim(); }
           return null;
         })()
-      `);
+      `, signal);
       this.dbg(`[delete] Confirmation click: ${confirmed ?? "none"}`);
 
       if (confirmed) {
@@ -1501,7 +1635,8 @@ export class ZoomClient {
             }
             return true;
           })()`,
-          8000
+          8000,
+          signal
         );
         if (deleted) {
           this.dbg(`[delete] UI delete confirmed for ${meetingId}`);
@@ -1565,7 +1700,7 @@ export class ZoomClient {
 
         return results;
       })()
-    `);
+    `, signal);
 
     this.dbg(`[delete] Fallback API results:`, fallbackResult);
 

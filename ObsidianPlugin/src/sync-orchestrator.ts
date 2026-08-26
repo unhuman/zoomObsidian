@@ -95,6 +95,17 @@ export class SyncOrchestrator {
     this.onProgress?.(msg);
   }
 
+  private abortError(signal: AbortSignal): Error {
+    const reason = signal.reason as unknown;
+    if (reason instanceof Error) return reason;
+    if (reason) return new Error(String(reason));
+    return new Error("Sync cancelled.");
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw this.abortError(signal);
+  }
+
   /**
    * Run the full sync workflow with timeout protection. Returns a report of all actions taken.
    * Processes both owned and shared meetings (if configured).
@@ -127,23 +138,27 @@ export class SyncOrchestrator {
     opts: { filter?: string; autoDelete?: boolean } | undefined,
     timeoutMs: number
   ): Promise<SyncReport> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        const msg = `Sync timeout after ${(timeoutMs / 1000).toFixed(0)}s`;
-        this.progress(msg);
-        reject(new Error(msg));
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const runPromise = this.runInternal(opts, controller.signal);
+    const timeoutPromise = new Promise<SyncReport>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        const error = new Error(`Sync timeout after ${(timeoutMs / 1000).toFixed(0)}s`);
+        controller.abort(error);
+        // Closing the BrowserWindow interrupts page execution immediately. The
+        // signal also reaches Node requests and prevents later phases from
+        // starting after the timeout fires.
+        this.client.closeScrapeWindow();
+        this.progress(error.message);
+        reject(error);
       }, timeoutMs);
-
-      this.runInternal(opts)
-        .then((result) => {
-          clearTimeout(timeout);
-          resolve(result);
-        })
-        .catch((e) => {
-          clearTimeout(timeout);
-          reject(e);
-        });
     });
+
+    try {
+      return await Promise.race([runPromise, timeoutPromise]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
 
   /**
@@ -152,7 +167,8 @@ export class SyncOrchestrator {
   private async runInternal(opts?: {
     filter?: string;
     autoDelete?: boolean;
-  }): Promise<SyncReport> {
+  }, signal?: AbortSignal): Promise<SyncReport> {
+    this.throwIfAborted(signal);
     const filter = opts?.filter ?? "";
     const autoDelete = opts?.autoDelete ?? false;
 
@@ -181,7 +197,10 @@ export class SyncOrchestrator {
       "owned",
       filter,
       autoDelete,
-      this.writer
+      this.writer,
+      undefined,
+      undefined,
+      signal
     );
     allResults.push(...ownedReport.results);
     totalWritten += ownedReport.written;
@@ -189,6 +208,7 @@ export class SyncOrchestrator {
     totalErrors += ownedReport.errors;
     totalDeleted += ownedReport.deleted;
     totalDeleteFailed += ownedReport.deleteFailed;
+    this.throwIfAborted(signal);
 
     // Also process shared meetings when folder is configured.
     let latestSharedMeetingDate: string | undefined;
@@ -209,7 +229,8 @@ export class SyncOrchestrator {
           false, // never auto-delete shared meetings (Zoom API limitation)
           sharedMeetingsWriter,
           this.lastProcessedShared,
-          this.writer  // mainWriter: enables routing shared 1:1s to person's 1:1 file
+          this.writer,  // mainWriter: enables routing shared 1:1s to person's 1:1 file
+          signal
         );
         allResults.push(...sharedReport.results);
         totalWritten += sharedReport.written;
@@ -222,6 +243,7 @@ export class SyncOrchestrator {
         }
         // Note: skip delete stats for shared (they're never deleted)
       } catch (e) {
+        if (signal?.aborted) throw e;
         this.progress(
           `Skipping shared meetings: ${(e as Error).message}`
         );
@@ -277,8 +299,10 @@ export class SyncOrchestrator {
     autoDelete: boolean,
     writer: VaultWriter,
     fromDate?: string,
-    mainWriter?: VaultWriter
+    mainWriter?: VaultWriter,
+    signal?: AbortSignal
   ): Promise<SyncReport> {
+    this.throwIfAborted(signal);
     const extractMeetingId = (m: MeetingSummaryItem): string => {
       const candidates = [
         m.meeting_id,
@@ -308,12 +332,13 @@ export class SyncOrchestrator {
 
     // Phase 1: list meetings
     this.progress(`[Phase 1] Listing ${sourceType} meeting summaries...`);
-    const listOpts: { from?: string } = {};
+    const listOpts: { from?: string; signal?: AbortSignal } = { signal };
     if (fromDate) {
       listOpts.from = fromDate;
       this.dbg(`[list] Using fromDate=${fromDate} for ${sourceType}`);
     }
-    const allMeetings = await this.client.listSummaries(sourceType as any, listOpts);
+    const allMeetings = await this.client.listSummaries(sourceType, listOpts);
+    this.throwIfAborted(signal);
     const meetings = filter
       ? allMeetings.filter((m) =>
           (m.meeting_topic ?? (m as Record<string, unknown>).column_1 ?? "")
@@ -346,6 +371,7 @@ export class SyncOrchestrator {
     const toFetchAttendees = new Map<string, string>();
 
     for (const m of meetings) {
+      this.throwIfAborted(signal);
       const topic = (
         m.meeting_topic ??
         (m as Record<string, unknown>).column_1 ??
@@ -386,9 +412,10 @@ export class SyncOrchestrator {
     }
 
     for (const [rawId, topic] of toFetchAttendees) {
+      this.throwIfAborted(signal);
       this.progress(`  Fetching attendees: ${topic} (${rawId})...`);
       try {
-        const data = await this.client.getSummary(rawId, sourceType);
+        const data = await this.client.getSummary(rawId, sourceType, undefined, undefined, signal);
         const names: string[] = [];
         for (const item of (data?.nextStepItems ?? data?.next_step_items ?? []) as Array<{
           assignees?: Array<{ username?: string }>;
@@ -401,9 +428,10 @@ export class SyncOrchestrator {
         if (names.length === 0) {
           this.dbg(`[attendees] nextStepItems empty for ${rawId}; trying participant report API`);
           try {
-            const participantNames = await this.client.getMeetingParticipants(rawId, sourceType);
+            const participantNames = await this.client.getMeetingParticipants(rawId, sourceType, signal);
             names.push(...participantNames);
           } catch (pe) {
+            if (signal?.aborted) throw pe;
             this.dbg(`[attendees] participant API error for ${rawId}: ${(pe as Error).message}`);
           }
         }
@@ -412,6 +440,7 @@ export class SyncOrchestrator {
         this.attendeesCache[rawId] = names;
         if (!this.summaryCache[rawId]) this.summaryCache[rawId] = data;
       } catch (e) {
+        if (signal?.aborted) throw e;
         this.progress(`  Error fetching attendees for ${rawId}: ${(e as Error).message}`);
         attendeesMap.set(rawId, []);
       }
@@ -422,6 +451,7 @@ export class SyncOrchestrator {
     const plan: SyncPlanEntry[] = [];
 
     for (const m of meetings) {
+      this.throwIfAborted(signal);
       const topic = (
         m.meeting_topic ??
         (m as Record<string, unknown>).column_1 ??
@@ -459,10 +489,28 @@ export class SyncOrchestrator {
         continue;
       }
 
-      // Group meeting: topic is 3+ colon-separated single-word names (e.g. "d:c:b").
-      // Sort alphabetically and route to a file named with the sorted parts (e.g. "b:c:d").
-      const topicPartsForGroup = topic.split(":").map((s) => s.trim()).filter((s) => s && /[a-zA-Z]{2,}/.test(s) && !/\s/.test(s));
-      const isGroupTopic = topicPartsForGroup.length >= 3 && sourceType === "owned";
+      // Group topics are colon-separated participant names. Keep full names in
+      // the split (the old single-word filter misclassified e.g. "Dhruti
+      // Shah: Alex Chen: Priya Rao" as a 1:1 topic).
+      const topicPartsForGroup = topic
+        .split(":")
+        .map((s) => s.trim())
+        .filter((s) => s && /[a-zA-Z]{2,}/.test(s));
+      const resolvedSelfFirst =
+        this.selfFirstName ||
+        (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
+      const isSelf = (n: string) =>
+        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
+      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
+      const topicNonSelf = topicPartsForGroup.filter((s) => !isSelf(s));
+      // If self is known, two non-self topic parts are enough evidence of a
+      // group. Without self identity, retain the safer three-part rule and use
+      // the participant API when it reports multiple non-self attendees.
+      const topicHasMultiplePeople = resolvedSelfFirst
+        ? topicNonSelf.length > 1
+        : topicPartsForGroup.length >= 3;
+      const isGroupTopic = sourceType === "owned" &&
+        (topicHasMultiplePeople || otherAttendees.length > 1);
       if (isGroupTopic) {
         const sortedParts = [...topicPartsForGroup].sort((a, b) =>
           a.toLowerCase().localeCompare(b.toLowerCase())
@@ -487,28 +535,18 @@ export class SyncOrchestrator {
       // Exact topic match anywhere in vault — route to that file regardless of attendees.
       if (sourceType === "owned") {
         const exactMatch = await writer.findFileByExactName(topic);
+        this.throwIfAborted(signal);
         if (exactMatch) {
           plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: exactMatch, action: "insert" });
           continue;
         }
       }
 
-      // Compute self/other attendees — used for both owned and shared 1:1 detection.
-      const resolvedSelfFirst =
-        this.selfFirstName ||
-        (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
-      const isSelf = (n: string) =>
-        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
-      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
-      // Use single-word colon parts only for the multi-person topic check.
-      // Multi-word parts like "Howard (alternate)" are parenthetical suffixes, not
-      // additional people — so they must not inflate topicNonSelf and trigger a skip.
-      const topicNonSelf = topicPartsForGroup.filter((s) => !isSelf(s));
-
       if (sourceType === "shared") {
         // Route shared 1:1s to the person's 1:1 vault file when possible.
-        if (otherAttendees.length === 1 && mainWriter) {
+        if (!topicHasMultiplePeople && otherAttendees.length === 1 && mainWriter) {
           const vaultFile1on1 = await mainWriter.findPersonFile(topic, otherAttendees);
+          this.throwIfAborted(signal);
           if (vaultFile1on1) {
             plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile: vaultFile1on1, action: "insert", useMainWriter: true });
             continue;
@@ -594,6 +632,7 @@ export class SyncOrchestrator {
     }
 
     for (const p of plan) {
+      this.throwIfAborted(signal);
       console.log(`[sync][phase3-result] topic="${p.topic}" action=${p.action} vaultFile=${p.vaultFile} parsedDate=${p.parsedDate}`);
     }
     const active = plan.filter((p) => p.action !== "skip");
@@ -618,6 +657,7 @@ export class SyncOrchestrator {
     };
 
     for (const { rawId, topic, instanceKey, dateHint, vaultFile, parsedDate, useMainWriter: entryUsesMain } of active) {
+      this.throwIfAborted(signal);
       console.log(`[sync][phase4] topic="${topic}" rawId=${rawId} instanceKey=${instanceKey} vaultFile=${vaultFile} parsedDate=${parsedDate} hasCached=${hasCachedContent(instanceKey)} inToFetch=${toFetchFull.has(instanceKey)}`);
       if (rawId && !hasCachedContent(instanceKey) && !toFetchFull.has(instanceKey)) {
         // Skip fetch if the vault file already has a non-placeholder summary for this date.
@@ -626,6 +666,7 @@ export class SyncOrchestrator {
         if (vaultFile && parsedDate) {
           const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
           const alreadyWritten = await entryWriter.hasExistingSummary(vaultFile, parsedDate, rawId);
+          this.throwIfAborted(signal);
           if (alreadyWritten) {
             this.dbg(`[fetch-plan] Already in vault, skipping fetch: instanceKey=${instanceKey} file=${vaultFile} date=${parsedDate}`);
             alreadyInVault.add(instanceKey);
@@ -642,14 +683,16 @@ export class SyncOrchestrator {
         `[Phase 4] Pre-fetching nav IDs for ${toFetchFull.size} meetings...`
       );
       const uniqueIds = [...new Set([...toFetchFull.values()].map(v => v.rawId))];
-      await this.client.prefetchNavIds(uniqueIds, sourceType);
+      await this.client.prefetchNavIds(uniqueIds, sourceType, signal);
     }
 
     for (const [instanceKey, { rawId, topic, dateHint }] of toFetchFull) {
+      this.throwIfAborted(signal);
       this.progress(`[Phase 4] Fetching: ${topic} (${rawId})...`);
       try {
-        this.summaryCache[instanceKey] = await this.client.getSummary(rawId, sourceType, topic, dateHint);
+        this.summaryCache[instanceKey] = await this.client.getSummary(rawId, sourceType, topic, dateHint, signal);
       } catch (e) {
+        if (signal?.aborted) throw e;
         this.progress(`[Phase 4] Error: ${(e as Error).message}`);
       }
     }
@@ -664,6 +707,7 @@ export class SyncOrchestrator {
     const toDelete: Array<{ topic: string; rawId: string }> = [];
 
     for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action, useMainWriter: entryUsesMain } of active) {
+      this.throwIfAborted(signal);
       const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
       // Track latest meeting date for scan-date bookkeeping
       if (parsedDate && (!latestMeetingDate || parsedDate > latestMeetingDate)) {
@@ -706,6 +750,7 @@ export class SyncOrchestrator {
         continue;
       }
       try {
+        this.throwIfAborted(signal);
         const r = await entryWriter.insertSummary(vaultFile, parsedDate, summary);
         if (r.inserted) {
           written++;
@@ -725,6 +770,7 @@ export class SyncOrchestrator {
           });
         }
       } catch (e) {
+        if (signal?.aborted) throw e;
         errors++;
         results.push({
           topic,
@@ -742,9 +788,10 @@ export class SyncOrchestrator {
     if (autoDelete && toDelete.length > 0) {
       this.progress(`[Phase 6] Deleting ${toDelete.length} summaries from Zoom...`);
       for (const { topic, rawId } of toDelete) {
+        this.throwIfAborted(signal);
         try {
           this.dbg(`[debug] Deleting "${topic}" (${rawId})...`);
-          const r = await this.client.deleteSummary(rawId);
+          const r = await this.client.deleteSummary(rawId, signal);
           if (r.success) {
             deleted++;
             this.progress(`[Phase 6] ✓ Deleted: ${topic}`);
@@ -755,6 +802,7 @@ export class SyncOrchestrator {
             this.dbg(`[warn] Failed to delete "${topic}" (${rawId}): ${r.message}`);
           }
         } catch (e) {
+          if (signal?.aborted) throw e;
           deleteFailed++;
           this.progress(`[Phase 6] ✗ Error: ${topic}: ${(e as Error).message}`);
           this.dbg(`[error] Exception deleting "${topic}" (${rawId}): ${(e as Error).message}`);

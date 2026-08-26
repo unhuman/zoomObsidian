@@ -31,6 +31,9 @@ export default class ZoomObsidianPlugin extends Plugin {
     if (this.settings?.debug) console.log("[zoom-obsidian]", ...args);
   }
 
+  /** Prevent overlapping sync commands from sharing the scrape window and caches. */
+  private syncInProgress = false;
+
   async onload(): Promise<void> {
     await this.loadSettings();
     await this.loadConfigState();
@@ -80,7 +83,7 @@ export default class ZoomObsidianPlugin extends Plugin {
     this.addCommand({
       id: "zoom-obsidian-logout",
       name: "Logout from Zoom",
-      callback: () => this.auth.logout(),
+      callback: () => this.logoutFromZoom(),
     });
 
     this.addCommand({
@@ -240,73 +243,107 @@ export default class ZoomObsidianPlugin extends Plugin {
     }
   }
 
-  private async runSync(): Promise<void> {
-    if (!(await this.ensureAuthenticated())) return;
-
-    // Validate shared meetings folder exists if specified
-    if (this.settings.sharedMeetingsFolder?.trim()) {
-      const folderPath = this.settings.sharedMeetingsFolder.trim();
-      const folder = this.app.vault.getAbstractFileByPath(folderPath);
-      if (!folder || !(folder instanceof TFolder)) {
-        notify(
-          `Error: Shared Meetings folder does not exist: "${folderPath}". Please create it or update the setting.`
-        );
-        return;
-      }
+  /** Clear both the stored Zoom cookies and the persistent Electron session. */
+  async logoutFromZoom(): Promise<void> {
+    if (this.syncInProgress) {
+      notify("A Zoom sync is already in progress. Wait for it to finish before logging out.");
+      return;
     }
 
-    // Apply latest settings to client/writer
-    this.client.setAccountId(this.settings.zoomAccountId ?? "");
-    // Rebuild writer in case settings changed
-    this.writer = new VaultWriter(this.app, {
-      vaultSubfolder: this.settings.vaultSubfolder,
-      oneOnOneFolders: this.parseOneFolders(),
-      myDisplayName: this.settings.myDisplayName || undefined,
-    });
-
-    const orchestrator = new SyncOrchestrator(this.client, this.writer, {
-      debug: this.settings.debug,
-      sharedMeetingsFolder: this.settings.sharedMeetingsFolder || undefined,
-      lastProcessedShared: this.configState.lastProcessedShared,
-      myDisplayName: this.settings.myDisplayName || undefined,
-    });
-
-    // Show progress via Notice
-    let lastNotice: Notice | undefined;
-    orchestrator.onProgress = (msg) => {
-      lastNotice?.hide();
-      lastNotice = notify(msg, 0);
-    };
+    let failure: unknown;
+    try {
+      await this.auth.logout();
+    } catch (e) {
+      failure = e;
+    }
 
     try {
-      const report = await orchestrator.run({
-        filter: this.settings.filter || undefined,
-        autoDelete: this.settings.autoDelete,
-      });
-      lastNotice?.hide();
+      await this.client.clearSession();
+    } catch (e) {
+      failure ??= e;
+    }
 
-      // Persist updated scan timestamps
-      if (report.updatedLastProcessedShared) {
-        this.configState.lastProcessedShared = report.updatedLastProcessedShared;
-        await this.saveConfigState();
+    if (failure) {
+      notify(`Zoom logout failed: ${(failure as Error).message}`);
+    }
+  }
+
+  private async runSync(): Promise<void> {
+    if (this.syncInProgress) {
+      notify("A Zoom sync is already in progress. The second request was skipped.");
+      return;
+    }
+    this.syncInProgress = true;
+
+    try {
+      if (!(await this.ensureAuthenticated())) return;
+
+      // Validate shared meetings folder exists if specified
+      if (this.settings.sharedMeetingsFolder?.trim()) {
+        const folderPath = this.settings.sharedMeetingsFolder.trim();
+        const folder = this.app.vault.getAbstractFileByPath(folderPath);
+        if (!folder || !(folder instanceof TFolder)) {
+          notify(
+            `Error: Shared Meetings folder does not exist: "${folderPath}". Please create it or update the setting.`
+          );
+          return;
+        }
       }
 
-      new SyncReportModal(this.app, report).open();
-    } catch (e) {
-      lastNotice?.hide();
-      const msg = (e as Error).message;
-      if (
-        msg.includes("session expired") ||
-        msg.includes("log in")
-      ) {
-        notify(
-          "Zoom session expired. Please re-login via Settings or the Login to Zoom command."
-        );
-      } else {
-        notify(`Sync failed: ${msg}`);
+      // Apply latest settings to client/writer
+      this.client.setAccountId(this.settings.zoomAccountId ?? "");
+      // Rebuild writer in case settings changed
+      this.writer = new VaultWriter(this.app, {
+        vaultSubfolder: this.settings.vaultSubfolder,
+        oneOnOneFolders: this.parseOneFolders(),
+        myDisplayName: this.settings.myDisplayName || undefined,
+      });
+
+      const orchestrator = new SyncOrchestrator(this.client, this.writer, {
+        debug: this.settings.debug,
+        sharedMeetingsFolder: this.settings.sharedMeetingsFolder || undefined,
+        lastProcessedShared: this.configState.lastProcessedShared,
+        myDisplayName: this.settings.myDisplayName || undefined,
+      });
+
+      // Show progress via Notice
+      let lastNotice: Notice | undefined;
+      orchestrator.onProgress = (msg) => {
+        lastNotice?.hide();
+        lastNotice = notify(msg, 0);
+      };
+
+      try {
+        const report = await orchestrator.run({
+          filter: this.settings.filter || undefined,
+          autoDelete: this.settings.autoDelete,
+        });
+        lastNotice?.hide();
+
+        // Persist updated scan timestamps
+        if (report.updatedLastProcessedShared) {
+          this.configState.lastProcessedShared = report.updatedLastProcessedShared;
+          await this.saveConfigState();
+        }
+
+        new SyncReportModal(this.app, report).open();
+      } catch (e) {
+        lastNotice?.hide();
+        const msg = (e as Error).message;
+        if (
+          msg.includes("session expired") ||
+          msg.includes("log in")
+        ) {
+          notify(
+            "Zoom session expired. Please re-login via Settings or the Login to Zoom command."
+          );
+        } else {
+          notify(`Sync failed: ${msg}`);
+        }
       }
     } finally {
       this.client.closeScrapeWindow();
+      this.syncInProgress = false;
     }
   }
 

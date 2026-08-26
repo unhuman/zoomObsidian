@@ -24,6 +24,7 @@ export interface SimpleResponse {
  * @param opts.headers Request headers (Cookie allowed)
  * @param opts.body    Request body string
  * @param opts.followRedirects  Follow 3xx redirects (default true)
+ * @param opts.signal  Abort signal for cancelling an in-flight request
  */
 export function nodeRequest(
   url: string,
@@ -32,6 +33,7 @@ export function nodeRequest(
     headers?: Record<string, string>;
     body?: string;
     followRedirects?: boolean;
+    signal?: AbortSignal;
   } = {}
 ): Promise<SimpleResponse> {
   return new Promise((resolve, reject) => {
@@ -45,6 +47,7 @@ export function nodeRequest(
       port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
       headers: opts.headers ?? {},
+      signal: opts.signal,
     };
 
     const req = mod.request(reqOpts, (res) => {

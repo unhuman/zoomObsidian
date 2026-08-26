@@ -88,9 +88,7 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
     if (this.plugin.settings.cookies.length > 0) {
       authSetting.addButton((btn) =>
         btn.setButtonText("Logout").onClick(async () => {
-          await this.plugin.auth.logout();
-          this.plugin.settings.cookies = [];
-          await this.plugin.saveSettings();
+          await this.plugin.logoutFromZoom();
           this.display();
         })
       );
