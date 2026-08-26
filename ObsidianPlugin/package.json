@@ -1,12 +1,13 @@
 {
   "name": "zoom-obsidian-plugin",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "npm run typecheck && node esbuild.config.mjs production",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

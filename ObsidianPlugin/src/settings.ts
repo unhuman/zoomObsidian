@@ -4,7 +4,6 @@
 
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type ZoomObsidianPlugin from "./main";
-import { notify } from "./types";
 
 export class ZoomObsidianSettingTab extends PluginSettingTab {
   plugin: ZoomObsidianPlugin;
@@ -75,12 +74,7 @@ export class ZoomObsidianSettingTab extends PluginSettingTab {
         )
         .setCta()
         .onClick(async () => {
-          try {
-            await this.plugin.auth.login(true);
-            notify("Zoom login successful.");
-          } catch (e) {
-            notify(`Zoom login failed: ${(e as Error).message}`);
-          }
+          await this.plugin.loginToZoom(true);
           this.display(); // refresh to show updated status
         })
     );

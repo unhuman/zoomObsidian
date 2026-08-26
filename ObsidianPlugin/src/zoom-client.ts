@@ -19,6 +19,7 @@ import type {
   NavIdEntry,
 } from "./types";
 import { nodeRequest, type SimpleResponse } from "./node-http";
+import { collectPaginatedItems, type ParticipantPage } from "./participant-pagination";
 
 // Electron is externalized by esbuild — available at runtime in Obsidian desktop
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1327,89 +1328,160 @@ export class ZoomClient {
     this.dbg(`[getParticipants] ${numericId} uuid=${uuidMeetingId}`);
 
     const win = await this.getOrCreateScrapeWindow(signal);
-    let raw: { accountId: string; storeKeys: string; body: unknown };
-    try {
-      raw = await this.awaitWithAbort(win.webContents.executeJavaScript(`
-        (async function() {
-          // Extract accountId from the SPA's Vuex store — search all modules
-          let accountId = ${JSON.stringify(this._accountId ?? '')};
-          let storeKeys = '';
-          if (!accountId) {
-            try {
-              const state = document.querySelector('#app').__vue_app__.config.globalProperties.$store.state;
-              storeKeys = Object.keys(state).join(',');
-              for (const key of Object.keys(state)) {
-                const mod = state[key];
-                if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
-                  accountId = mod.accountId;
-                  break;
-                }
-              }
-              if (!accountId && typeof state.accountId === 'string') accountId = state.accountId;
-            } catch(e) {}
-            try {
-              if (!accountId) {
-                const state = document.querySelector('#app').__vue__.$store.state;
-                storeKeys = storeKeys || Object.keys(state).join(',');
-                for (const key of Object.keys(state)) {
-                  const mod = state[key];
-                  if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
-                    accountId = mod.accountId;
-                    break;
-                  }
-                }
-              }
-            } catch(e) {}
-            try {
-              if (!accountId) {
-                const candidates = ['zoomConfig','zoomInitData','ZM','__zm__','zoomData'];
-                for (const k of candidates) {
-                  if (window[k]?.accountId) { accountId = window[k].accountId; break; }
-                }
-              }
-            } catch(e) {}
-          }
+    type ParticipantRecord = {
+      name?: string;
+      email?: string;
+      roomDisplayName?: string;
+    };
+    type ParticipantApiResult = {
+      list?: ParticipantRecord[];
+      meetingInfo?: { email?: string; hostName?: string };
+      pagination?: Record<string, unknown>;
+      pageInfo?: Record<string, unknown>;
+      [key: string]: unknown;
+    };
+    type ParticipantApiResponse = {
+      status?: boolean;
+      result?: ParticipantApiResult;
+    };
+    type ParticipantPageResponse = {
+      accountId: string;
+      storeKeys: string;
+      body: ParticipantApiResponse;
+    };
 
-          const resp = await fetch(${JSON.stringify(url)}, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({
-              accountId,
-              groupId: '',
-              isShowPersonal: true,
-              isShowUniqueAttendee: false,
-              meetingId: ${JSON.stringify(uuidMeetingId)},
-              page: 1,
-              scheduleForUserId: '',
-            }),
-          });
-          const body = await resp.json();
-          return { accountId, storeKeys, body };
-        })()
-      `), signal);
+    let firstPage: ParticipantPageResponse | undefined;
+    let accountId = "";
+    let storeKeys = "";
+    let pagesFetched = 0;
+    let participantPages: ParticipantRecord[] = [];
+    try {
+      const collected = await collectPaginatedItems<ParticipantRecord>(
+        async (page): Promise<ParticipantPage<ParticipantRecord>> => {
+          const pageResult = await this.awaitWithAbort(
+            win.webContents.executeJavaScript(`
+              (async function() {
+                // Extract accountId from the SPA's Vuex store — search all modules
+                let accountId = ${JSON.stringify(this._accountId ?? '')};
+                let storeKeys = '';
+                if (!accountId) {
+                  try {
+                    const state = document.querySelector('#app').__vue_app__.config.globalProperties.$store.state;
+                    storeKeys = Object.keys(state).join(',');
+                    for (const key of Object.keys(state)) {
+                      const mod = state[key];
+                      if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
+                        accountId = mod.accountId;
+                        break;
+                      }
+                    }
+                    if (!accountId && typeof state.accountId === 'string') accountId = state.accountId;
+                  } catch(e) {}
+                  try {
+                    if (!accountId) {
+                      const state = document.querySelector('#app').__vue__.$store.state;
+                      storeKeys = storeKeys || Object.keys(state).join(',');
+                      for (const key of Object.keys(state)) {
+                        const mod = state[key];
+                        if (mod && typeof mod === 'object' && typeof mod.accountId === 'string' && mod.accountId) {
+                          accountId = mod.accountId;
+                          break;
+                        }
+                      }
+                    }
+                  } catch(e) {}
+                  try {
+                    if (!accountId) {
+                      const candidates = ['zoomConfig','zoomInitData','ZM','__zm__','zoomData'];
+                      for (const k of candidates) {
+                        if (window[k]?.accountId) { accountId = window[k].accountId; break; }
+                      }
+                    }
+                  } catch(e) {}
+                }
+
+                const resp = await fetch(${JSON.stringify(url)}, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                  body: JSON.stringify({
+                    accountId,
+                    groupId: '',
+                    isShowPersonal: true,
+                    isShowUniqueAttendee: false,
+                    meetingId: ${JSON.stringify(uuidMeetingId)},
+                    page: ${page},
+                    scheduleForUserId: '',
+                  }),
+                });
+                const body = await resp.json();
+                return { accountId, storeKeys, body };
+              })()
+            `) as Promise<ParticipantPageResponse>,
+            signal
+          );
+          firstPage ??= pageResult;
+          accountId ||= pageResult.accountId;
+          storeKeys ||= pageResult.storeKeys;
+
+          const result = pageResult.body?.result;
+          const metadata = (result?.pagination ?? result?.pageInfo ?? result) as
+            | Record<string, unknown>
+            | undefined;
+          const readNumber = (...values: unknown[]): number | undefined => {
+            for (const value of values) {
+              const parsed = typeof value === "number"
+                ? value
+                : typeof value === "string" && value.trim()
+                  ? Number(value)
+                  : Number.NaN;
+              if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+            }
+            return undefined;
+          };
+
+          return {
+            items: Array.isArray(result?.list) ? result.list : [],
+            total: readNumber(
+              metadata?.total,
+              metadata?.totalCount,
+              metadata?.total_count
+            ),
+            totalPages: readNumber(
+              metadata?.totalPages,
+              metadata?.totalPage,
+              metadata?.pages,
+              metadata?.page_count
+            ),
+            pageSize: readNumber(metadata?.pageSize, metadata?.page_size, metadata?.size),
+          };
+        },
+        { maxPages: 100, signal }
+      );
+      participantPages = collected.items;
+      pagesFetched = collected.pagesFetched;
     } catch (e) {
       if (signal?.aborted) throw e;
       this.dbg(`[getParticipants] Fetch error for ${numericId}: ${(e as Error).message}`);
       return [];
     }
 
-    const result = raw?.body as { status?: boolean; result?: { list?: Array<{ name?: string; email?: string; roomDisplayName?: string }> } } | undefined;
-    this.dbg(`[getParticipants] ${numericId} accountId="${raw?.accountId}" storeKeys="${raw?.storeKeys}" status=${result?.status} keys=${result?.result ? Object.keys(result.result).join(',') : 'none'} raw=${JSON.stringify(result).substring(0, 300)}`);
+    const result = firstPage?.body;
+    this.dbg(`[getParticipants] ${numericId} accountId="${accountId}" storeKeys="${storeKeys}" pages=${pagesFetched} status=${result?.status} keys=${result?.result ? Object.keys(result.result).join(',') : 'none'} raw=${JSON.stringify(result).substring(0, 300)}`);
 
-    if (!result?.result?.list) {
+    if (!result?.result || !Array.isArray(result.result.list)) {
       this.dbg(`[getParticipants] No list in response for ${numericId}`);
       return [];
     }
 
-    const meetingInfo = (result.result as any).meetingInfo ?? {};
+    const meetingInfo = result.result.meetingInfo ?? {};
     const hostEmail = (meetingInfo.email ?? '').toLowerCase();
-    const hostName = (meetingInfo.hostName ?? '') as string;
+    const hostName = meetingInfo.hostName ?? '';
     if (hostName && !this._detectedMyName) {
       this._detectedMyName = hostName;
       this.dbg(`[getParticipants] Detected self display name: "${hostName}"`);
     }
 
-    const humans = result.result.list.filter(p => {
+    const humans = participantPages.filter(p => {
       const email = (p.email ?? '').toLowerCase();
       if (email.startsWith('zoomroom_') || p.roomDisplayName) return false; // Zoom Room devices
       if (hostEmail && email === hostEmail) return false; // self (meeting host)
@@ -1434,17 +1506,24 @@ export class ZoomClient {
    */
   async deleteSummary(
     meetingId: string,
+    dateHintOrSignal?: string | AbortSignal,
     signal?: AbortSignal
   ): Promise<{ success: boolean; message: string }> {
-    this.throwIfAborted(signal);
+    const dateHint = typeof dateHintOrSignal === "string"
+      ? dateHintOrSignal
+      : undefined;
+    const abortSignal = typeof dateHintOrSignal === "string"
+      ? signal
+      : dateHintOrSignal;
+    this.throwIfAborted(abortSignal);
     const numericId = meetingId.replace(/[\s-]/g, "");
     const baseUrl = this.auth.baseUrl;
-    const cacheKey = this.navCacheKey(numericId, 'owned');
+    const cacheKey = this.navCacheKey(numericId, 'owned', dateHint);
     console.log(`[zoom-client][delete] START meetingId=${meetingId} numericId=${numericId} cacheHit=${this.navIdCache.has(cacheKey)}`);
 
     let navEntry: NavIdEntry | undefined = this.navIdCache.get(cacheKey);
     if (!navEntry) {
-      navEntry = (await this.resolveNavId(numericId, 'owned', undefined, signal)) ?? undefined;
+      navEntry = (await this.resolveNavId(numericId, 'owned', dateHint, abortSignal)) ?? undefined;
       console.log(`[zoom-client][delete] resolveNavId result: ${navEntry ? `meetingId=${navEntry.uuidMeetingId}` : "null (not found)"}`);
       if (!navEntry) {
         return {
@@ -1456,22 +1535,22 @@ export class ZoomClient {
       console.log(`[zoom-client][delete] Using cached navEntry: meetingId=${navEntry.uuidMeetingId}`);
     }
 
-    const { uuidMeetingId, summaryId } = navEntry;
+    let { uuidMeetingId, summaryId } = navEntry;
     const detailUrl = `${baseUrl}/user/meeting/summary#/detail?meetingId=${encodeURIComponent(uuidMeetingId)}&summaryId=${encodeURIComponent(summaryId)}`;
 
     // If resolveNavId already navigated to this detail page via an in-page click,
     // skip the loadURL() call — a cold reload is slower and less reliable than the
     // in-page hash navigation that resolveNavId uses.
-    const currentHash = await this.execInWindow<string>(`window.location.hash`, signal).catch((e) => {
-      if (signal?.aborted) throw e;
+    const currentHash = await this.execInWindow<string>(`window.location.hash`, abortSignal).catch((e) => {
+      if (abortSignal?.aborted) throw e;
       return "";
     });
     const alreadyOnDetail = currentHash.startsWith("#/detail") && currentHash.includes(encodeURIComponent(uuidMeetingId));
     console.log(`[zoom-client][delete] currentHash=${currentHash} alreadyOnDetail=${alreadyOnDetail}`);
     if (!alreadyOnDetail) {
       console.log(`[zoom-client][delete] Navigating to detail: ${detailUrl}`);
-      await this.navigateScrapeWindow(detailUrl, signal);
-      await this.waitForCondition(`window.location.hash.startsWith("#/detail")`, 5000, signal);
+      await this.navigateScrapeWindow(detailUrl, abortSignal);
+      await this.waitForCondition(`window.location.hash.startsWith("#/detail")`, 5000, abortSignal);
     } else {
       console.log(`[zoom-client][delete] Already on detail page, skipping reload`);
     }
@@ -1492,7 +1571,7 @@ export class ZoomClient {
         return false;
       })()
     `;
-    const deleteButtonReady = await this.waitForCondition(deleteButtonCondition, 15000, signal);
+    const deleteButtonReady = await this.waitForCondition(deleteButtonCondition, 15000, abortSignal);
     console.log(`[zoom-client][delete] deleteButtonReady=${deleteButtonReady}`);
 
     if (!deleteButtonReady) {
@@ -1508,32 +1587,35 @@ export class ZoomClient {
           }
           return out.join('\\n') || '(no buttons found)';
         })()
-      `, signal).catch((e) => {
-        if (signal?.aborted) throw e;
+      `, abortSignal).catch((e) => {
+        if (abortSignal?.aborted) throw e;
         return "(error dumping buttons)";
       });
       this.dbg(`[delete] Delete button not found. Page buttons:\n${btnDump}`);
       let debugHash = "?";
       try {
-        debugHash = await this.execInWindow<string>(`window.location.hash`, signal);
+        debugHash = await this.execInWindow<string>(`window.location.hash`, abortSignal);
       } catch (e) {
-        if (signal?.aborted) throw e;
+        if (abortSignal?.aborted) throw e;
       }
       this.dbg(`[delete] Current hash: `, debugHash);
 
       // Maybe stale cache — evict and re-resolve
       this.navIdCache.delete(cacheKey);
-      const retryNav = await this.resolveNavId(numericId, 'owned', undefined, signal);
+      const retryNav = await this.resolveNavId(numericId, 'owned', dateHint, abortSignal);
       if (!retryNav) {
         return {
           success: true,
           message: `Meeting ${meetingId} not found (already deleted).`,
         };
       }
+      navEntry = retryNav;
+      uuidMeetingId = retryNav.uuidMeetingId;
+      summaryId = retryNav.summaryId;
       // Navigate to the fresh detail URL
       const retryUrl = `${baseUrl}/user/meeting/summary#/detail?meetingId=${encodeURIComponent(retryNav.uuidMeetingId)}&summaryId=${encodeURIComponent(retryNav.summaryId)}`;
-      await this.navigateScrapeWindow(retryUrl, signal);
-      const retryReady = await this.waitForCondition(deleteButtonCondition, 15000, signal);
+      await this.navigateScrapeWindow(retryUrl, abortSignal);
+      const retryReady = await this.waitForCondition(deleteButtonCondition, 15000, abortSignal);
       if (!retryReady) {
         return {
           success: false,
@@ -1557,7 +1639,7 @@ export class ZoomClient {
         if (deleteEl) { deleteEl.click(); return "clicked: " + deleteEl.textContent?.trim(); }
         return null;
       })()
-    `, signal);
+    `, abortSignal);
     this.dbg(`[delete] Click result: ${clicked ?? "NO BUTTON FOUND"}`);
 
     if (!clicked) {
@@ -1573,10 +1655,10 @@ export class ZoomClient {
           if (moreEl) { moreEl.click(); return true; }
           return false;
         })()
-      `, signal);
+      `, abortSignal);
 
       if (menuOpened) {
-        await this.delay(500, signal);
+        await this.delay(500, abortSignal);
         await this.execInWindow<boolean>(`
           (() => {
             const allEls = Array.from(document.querySelectorAll(
@@ -1590,20 +1672,20 @@ export class ZoomClient {
             if (deleteEl) { deleteEl.click(); return true; }
             return false;
           })()
-        `, signal);
+        `, abortSignal);
       }
     }
 
     // Wait for the "Move to Trash" confirmation dialog.
     // Give the dialog time to animate in after the delete click.
-    await this.delay(600, signal);
+    await this.delay(600, abortSignal);
     const confirmReady = await this.waitForCondition(
       `Array.from(document.querySelectorAll("button")).some(function(e) {
         var txt = (e.textContent || '').trim().toLowerCase();
         return txt === "move to trash";
       })`,
       4000,
-      signal
+      abortSignal
     );
 
     let uiDeleteSucceeded = false;
@@ -1620,7 +1702,7 @@ export class ZoomClient {
           if (confirmEl) { confirmEl.click(); return confirmEl.textContent?.trim(); }
           return null;
         })()
-      `, signal);
+      `, abortSignal);
       this.dbg(`[delete] Confirmation click: ${confirmed ?? "none"}`);
 
       if (confirmed) {
@@ -1636,7 +1718,7 @@ export class ZoomClient {
             return true;
           })()`,
           8000,
-          signal
+          abortSignal
         );
         if (deleted) {
           this.dbg(`[delete] UI delete confirmed for ${meetingId}`);
@@ -1700,7 +1782,7 @@ export class ZoomClient {
 
         return results;
       })()
-    `, signal);
+    `, abortSignal);
 
     this.dbg(`[delete] Fallback API results:`, fallbackResult);
 
@@ -1714,7 +1796,7 @@ export class ZoomClient {
     });
 
     if (succeeded) {
-      this.navIdCache.delete(numericId);
+      this.navIdCache.delete(cacheKey);
       return {
         success: true,
         message: `Deleted summary for meeting ${meetingId} (API fallback).`,

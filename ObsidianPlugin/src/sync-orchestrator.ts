@@ -16,6 +16,9 @@ import type { ZoomClient } from "./zoom-client";
 import type { VaultWriter } from "./vault-writer";
 import type { MeetingSummaryItem, MeetingSummaryDetail, ZoomSummaryData } from "./types";
 import { notify } from "./types";
+import { runWithTimeout as runSyncWithTimeout } from "./timeout";
+import { classifyMeetingParticipants } from "./meeting-routing";
+import { runDeletePhase, type DeletionTarget } from "./delete-phase";
 
 export interface SyncPlanEntry {
   topic: string;
@@ -138,27 +141,17 @@ export class SyncOrchestrator {
     opts: { filter?: string; autoDelete?: boolean } | undefined,
     timeoutMs: number
   ): Promise<SyncReport> {
-    const controller = new AbortController();
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const runPromise = this.runInternal(opts, controller.signal);
-    const timeoutPromise = new Promise<SyncReport>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        const error = new Error(`Sync timeout after ${(timeoutMs / 1000).toFixed(0)}s`);
-        controller.abort(error);
+    return runSyncWithTimeout(
+      (signal) => this.runInternal(opts, signal),
+      timeoutMs,
+      (error) => {
         // Closing the BrowserWindow interrupts page execution immediately. The
         // signal also reaches Node requests and prevents later phases from
         // starting after the timeout fires.
         this.client.closeScrapeWindow();
         this.progress(error.message);
-        reject(error);
-      }, timeoutMs);
-    });
-
-    try {
-      return await Promise.race([runPromise, timeoutPromise]);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
+      }
+    );
   }
 
   /**
@@ -489,28 +482,29 @@ export class SyncOrchestrator {
         continue;
       }
 
-      // Group topics are colon-separated participant names. Keep full names in
-      // the split (the old single-word filter misclassified e.g. "Dhruti
-      // Shah: Alex Chen: Priya Rao" as a 1:1 topic).
-      const topicPartsForGroup = topic
-        .split(":")
-        .map((s) => s.trim())
-        .filter((s) => s && /[a-zA-Z]{2,}/.test(s));
       const resolvedSelfFirst =
         this.selfFirstName ||
         (this.client.getDetectedMyName().split(/\s+/)[0] ?? '').toLowerCase();
-      const isSelf = (n: string) =>
-        resolvedSelfFirst ? n.toLowerCase().includes(resolvedSelfFirst) : false;
-      const otherAttendees = attendees.filter((n) => !isSelf(n) && !/\d/.test(n));
-      const topicNonSelf = topicPartsForGroup.filter((s) => !isSelf(s));
-      // If self is known, two non-self topic parts are enough evidence of a
-      // group. Without self identity, retain the safer three-part rule and use
-      // the participant API when it reports multiple non-self attendees.
-      const topicHasMultiplePeople = resolvedSelfFirst
-        ? topicNonSelf.length > 1
-        : topicPartsForGroup.length >= 3;
-      const isGroupTopic = sourceType === "owned" &&
-        (topicHasMultiplePeople || otherAttendees.length > 1);
+      const classification = classifyMeetingParticipants(
+        topic,
+        attendees,
+        resolvedSelfFirst,
+        sourceType
+      );
+      const {
+        topicParts: topicPartsForGroup,
+        topicNonSelf,
+        otherAttendees,
+        topicHasMultiplePeople,
+        isGroupTopic,
+      } = classification;
+      this.dbg(
+        `[plan] participant classification topic="${topic}" ` +
+          `parts=${JSON.stringify(topicPartsForGroup)} ` +
+          `nonSelf=${JSON.stringify(topicNonSelf)} ` +
+          `otherAttendees=${JSON.stringify(otherAttendees)} ` +
+          `group=${isGroupTopic}`
+      );
       if (isGroupTopic) {
         const sortedParts = [...topicPartsForGroup].sort((a, b) =>
           a.toLowerCase().localeCompare(b.toLowerCase())
@@ -704,9 +698,9 @@ export class SyncOrchestrator {
     let errors = 0;
     let latestMeetingDate: string | undefined;
     const results: SyncResult[] = [];
-    const toDelete: Array<{ topic: string; rawId: string }> = [];
+    const toDelete: DeletionTarget[] = [];
 
-    for (const { topic, rawId, parsedDate, instanceKey, vaultFile, action, useMainWriter: entryUsesMain } of active) {
+    for (const { topic, rawId, parsedDate, dateHint, instanceKey, vaultFile, action, useMainWriter: entryUsesMain } of active) {
       this.throwIfAborted(signal);
       const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
       // Track latest meeting date for scan-date bookkeeping
@@ -724,7 +718,7 @@ export class SyncOrchestrator {
           results.push({ topic, status: `SKIP (already synced) @ ${parsedDate}` });
           // Still queue for deletion — if auto-delete is on and the meeting is still
           // in Zoom (e.g. a previous deletion failed), retry the delete now.
-          toDelete.push({ topic, rawId });
+          toDelete.push({ topic, rawId, dateHint });
         } else {
           results.push({ topic, status: `SKIP (no summary) @ ${parsedDate}` });
         }
@@ -736,7 +730,7 @@ export class SyncOrchestrator {
           this.dbg(`[info] No transcript for "${topic}" (${rawId}) — marking MISSING`);
           skipped++;
           results.push({ topic, status: `MISSING @ ${parsedDate}` });
-          toDelete.push({ topic, rawId });
+          toDelete.push({ topic, rawId, dateHint });
         } else {
           const errorDetail = (summary as Record<string, unknown>).error
             ? ` error=${String((summary as Record<string, unknown>).error)}`
@@ -754,7 +748,7 @@ export class SyncOrchestrator {
         const r = await entryWriter.insertSummary(vaultFile, parsedDate, summary);
         if (r.inserted) {
           written++;
-          toDelete.push({ topic, rawId });
+          toDelete.push({ topic, rawId, dateHint });
           results.push({
             topic,
             file: r.filePath,
@@ -762,7 +756,7 @@ export class SyncOrchestrator {
           });
         } else {
           skipped++;
-          toDelete.push({ topic, rawId });
+          toDelete.push({ topic, rawId, dateHint });
           results.push({
             topic,
             file: r.filePath,
@@ -787,27 +781,30 @@ export class SyncOrchestrator {
     this.dbg(`[info] Phase 6: autoDelete=${autoDelete}, toDelete.length=${toDelete.length}, meetings to delete: ${toDelete.map(d => `"${d.topic}" (${d.rawId})`).join(", ")}`);
     if (autoDelete && toDelete.length > 0) {
       this.progress(`[Phase 6] Deleting ${toDelete.length} summaries from Zoom...`);
-      for (const { topic, rawId } of toDelete) {
-        this.throwIfAborted(signal);
-        try {
-          this.dbg(`[debug] Deleting "${topic}" (${rawId})...`);
-          const r = await this.client.deleteSummary(rawId, signal);
-          if (r.success) {
-            deleted++;
-            this.progress(`[Phase 6] ✓ Deleted: ${topic}`);
-            this.dbg(`[debug] Successfully deleted "${topic}" (${rawId})`);
-          } else {
-            deleteFailed++;
-            this.progress(`[Phase 6] ✗ Failed: ${topic}: ${r.message}`);
-            this.dbg(`[warn] Failed to delete "${topic}" (${rawId}): ${r.message}`);
-          }
-        } catch (e) {
-          if (signal?.aborted) throw e;
-          deleteFailed++;
-          this.progress(`[Phase 6] ✗ Error: ${topic}: ${(e as Error).message}`);
-          this.dbg(`[error] Exception deleting "${topic}" (${rawId}): ${(e as Error).message}`);
+      const deleteReport = await runDeletePhase(
+        toDelete,
+        (meetingId, dateHint, deleteSignal) =>
+          this.client.deleteSummary(meetingId, dateHint, deleteSignal),
+        {
+          signal,
+          onEvent: (event) => {
+            if (event.type === "start") {
+              this.dbg(`[debug] Deleting "${event.target.topic}" (${event.target.rawId}) dateHint="${event.target.dateHint ?? ""}"...`);
+            } else if (event.type === "success") {
+              this.progress(`[Phase 6] ✓ Deleted: ${event.target.topic}`);
+              this.dbg(`[debug] Successfully deleted "${event.target.topic}" (${event.target.rawId})`);
+            } else if (event.exception) {
+              this.progress(`[Phase 6] ✗ Error: ${event.target.topic}: ${event.message}`);
+              this.dbg(`[error] Exception deleting "${event.target.topic}" (${event.target.rawId}): ${event.message}`);
+            } else {
+              this.progress(`[Phase 6] ✗ Failed: ${event.target.topic}: ${event.message}`);
+              this.dbg(`[warn] Failed to delete "${event.target.topic}" (${event.target.rawId}): ${event.message}`);
+            }
+          },
         }
-      }
+      );
+      deleted = deleteReport.deleted;
+      deleteFailed = deleteReport.deleteFailed;
     } else if (toDelete.length > 0) {
       this.dbg(`[info] autoDelete is disabled; skipping deletion of ${toDelete.length} meetings`);
     }

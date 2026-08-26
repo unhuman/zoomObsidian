@@ -15,6 +15,7 @@ import { ZoomClient } from "./zoom-client";
 import { VaultWriter } from "./vault-writer";
 import { SyncOrchestrator, type SyncReport } from "./sync-orchestrator";
 import { ZoomObsidianSettingTab } from "./settings";
+import { OperationLock } from "./operation-lock";
 
 export default class ZoomObsidianPlugin extends Plugin {
   settings!: ZoomObsidianSettings;
@@ -31,8 +32,35 @@ export default class ZoomObsidianPlugin extends Plugin {
     if (this.settings?.debug) console.log("[zoom-obsidian]", ...args);
   }
 
-  /** Prevent overlapping sync commands from sharing the scrape window and caches. */
-  private syncInProgress = false;
+  /** Serialize all operations that use Zoom auth, the SPA, or shared caches. */
+  private operationLock = new OperationLock();
+
+  private beginOperation(operation: string): boolean {
+    if (this.operationLock.tryAcquire(operation)) return true;
+
+    const active = this.operationLock.activeOperation;
+    const label = (value: string | null) => {
+      switch (value) {
+        case "sync": return "a sync";
+        case "login": return "a login";
+        case "logout": return "a logout";
+        case "list": return "a summary list";
+        case "diagnosis": return "a diagnosis";
+        default: return "another Zoom operation";
+      }
+    };
+
+    if (operation === "sync" && active === "sync") {
+      notify("A Zoom sync is already in progress. The second request was skipped.");
+    } else {
+      notify(`${label(active)} is already in progress. This request was skipped.`);
+    }
+    return false;
+  }
+
+  private endOperation(operation: string): void {
+    this.operationLock.release(operation);
+  }
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -233,47 +261,51 @@ export default class ZoomObsidianPlugin extends Plugin {
     }
   }
 
-  private async doLogin(): Promise<void> {
+  async loginToZoom(force = true): Promise<void> {
+    if (!this.beginOperation("login")) return;
     try {
       // Explicit login command — always start a fresh session.
-      await this.auth.login(true);
+      await this.auth.login(force);
       notify("Zoom login successful.");
     } catch (e) {
       notify(`Zoom login failed: ${(e as Error).message}`);
+    } finally {
+      this.endOperation("login");
     }
+  }
+
+  private async doLogin(): Promise<void> {
+    await this.loginToZoom(true);
   }
 
   /** Clear both the stored Zoom cookies and the persistent Electron session. */
   async logoutFromZoom(): Promise<void> {
-    if (this.syncInProgress) {
-      notify("A Zoom sync is already in progress. Wait for it to finish before logging out.");
-      return;
-    }
+    if (!this.beginOperation("logout")) return;
 
     let failure: unknown;
     try {
-      await this.auth.logout();
-    } catch (e) {
-      failure = e;
-    }
+      try {
+        await this.auth.logout();
+      } catch (e) {
+        failure = e;
+      }
 
-    try {
-      await this.client.clearSession();
-    } catch (e) {
-      failure ??= e;
-    }
+      try {
+        await this.client.clearSession();
+      } catch (e) {
+        failure ??= e;
+      }
 
-    if (failure) {
-      notify(`Zoom logout failed: ${(failure as Error).message}`);
+      if (failure) {
+        notify(`Zoom logout failed: ${(failure as Error).message}`);
+      }
+    } finally {
+      this.endOperation("logout");
     }
   }
 
   private async runSync(): Promise<void> {
-    if (this.syncInProgress) {
-      notify("A Zoom sync is already in progress. The second request was skipped.");
-      return;
-    }
-    this.syncInProgress = true;
+    if (!this.beginOperation("sync")) return;
 
     try {
       if (!(await this.ensureAuthenticated())) return;
@@ -342,35 +374,46 @@ export default class ZoomObsidianPlugin extends Plugin {
         }
       }
     } finally {
-      this.client.closeScrapeWindow();
-      this.syncInProgress = false;
+      try {
+        this.client.closeScrapeWindow();
+      } finally {
+        this.endOperation("sync");
+      }
     }
   }
 
   private async runSpaDiagnosis(): Promise<void> {
-    if (!(await this.ensureAuthenticated())) return;
-    notify("Opening Zoom SPA in browser window — check Obsidian console (Ctrl+Shift+I) for full report.", 8000);
+    if (!this.beginOperation("diagnosis")) return;
     try {
+      if (!(await this.ensureAuthenticated())) return;
+      notify("Opening Zoom SPA in browser window — check Obsidian console (Ctrl+Shift+I) for full report.", 8000);
       const report = await this.client.diagnoseSpa();
       // Show a condensed version in a modal
       new DiagnosticModal(this.app, report).open();
     } catch (e) {
       notify(`Diagnosis failed: ${(e as Error).message}`);
+    } finally {
+      this.endOperation("diagnosis");
     }
   }
 
   private async showSummaryList(): Promise<void> {
-    if (!(await this.ensureAuthenticated())) return;
-
-    notify("Fetching Zoom summaries...", 0);
+    if (!this.beginOperation("list")) return;
     try {
+      if (!(await this.ensureAuthenticated())) return;
+
+      notify("Fetching Zoom summaries...", 0);
       const meetings = await this.client.listSummaries();
       new Notice("", 1); // dismiss
       new SummaryListModal(this.app, meetings).open();
     } catch (e) {
       notify(`Failed to list summaries: ${(e as Error).message}`);
     } finally {
-      this.client.closeScrapeWindow();
+      try {
+        this.client.closeScrapeWindow();
+      } finally {
+        this.endOperation("list");
+      }
     }
   }
 }

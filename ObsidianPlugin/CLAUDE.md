@@ -7,9 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 npm run dev       # Development build with watch/rebuild
 npm run build     # Production build (minified)
+npm test           # Automated unit tests
 ```
 
-No automated tests — testing is manual by loading the plugin in Obsidian.
+The automated tests cover the dependency-free operation, timeout, pagination,
+routing, and deletion helpers. BrowserWindow and Obsidian integration still
+requires manual verification by loading the plugin in Obsidian.
 
 ## Deployment
 

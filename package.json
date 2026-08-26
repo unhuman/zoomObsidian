@@ -1,6 +1,6 @@
 {
   "name": "zoom-meeting-summaries-mcp",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "description": "MCP server for fetching Zoom meeting summaries via browser-based authentication",
   "type": "module",
   "main": "build/index.js",
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "npm --prefix ObsidianPlugin test"
   },
   "keywords": [
     "mcp",
