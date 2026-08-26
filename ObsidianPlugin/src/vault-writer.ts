@@ -271,7 +271,11 @@ export class VaultWriter {
     const i2 = baseIndent + indentUnit + indentUnit;
     const lines: string[] = [];
 
-    if (includeLabel) lines.push(`${baseIndent}Zoom AI Summary`);
+    if (includeLabel) {
+      const meetingId = String(summary.meeting_id ?? "").trim();
+      const idSuffix = meetingId ? ` (ID: ${meetingId})` : "";
+      lines.push(`${baseIndent}Zoom AI Summary${idSuffix}`);
+    }
 
     const overall = (
       (summary.overallSummary ?? summary.summaryOverview ?? summary.summary_overview) as
@@ -325,13 +329,13 @@ export class VaultWriter {
   /**
    * Format the summary as a standalone dated section.
    *
-   * If hasMeetingIdSuffix is true, appends " (ID: {meeting_id})" to the date header
-   * to distinguish same-named meetings occurring on the same date.
+   * Appends " (ID: {meeting_id})" to the date header when the meeting ID is
+   * available, so a later sync can identify the exact meeting instance.
    */
-  formatSummarySection(dateStr: string, summary: ZoomSummaryData, hasMeetingIdSuffix = false): string {
-    const headerDate = hasMeetingIdSuffix 
-      ? `${dateStr} - Zoom AI Summary (ID: ${summary.meeting_id})`
-      : `${dateStr} - Zoom AI Summary`;
+  formatSummarySection(dateStr: string, summary: ZoomSummaryData): string {
+    const meetingId = String(summary.meeting_id ?? "").trim();
+    const idSuffix = meetingId ? ` (ID: ${meetingId})` : "";
+    const headerDate = `${dateStr} - Zoom AI Summary${idSuffix}`;
     return (
       `${headerDate}\n` +
       this.formatSummaryBody(summary, "", false)
@@ -342,8 +346,8 @@ export class VaultWriter {
    * Insert the formatted summary into the file at the correct chronological
    * position (newest-first), creating the file if it doesn't exist.
    *
-   * If another Zoom summary with the same date already exists, appends an ID suffix
-   * to distinguish them (e.g., "2026-03-17 - Zoom AI Summary (ID: 12345)").
+   * Every generated Zoom heading includes the meeting ID when available, which
+   * distinguishes multiple meetings occurring on the same date.
    *
    * Returns { inserted, position, filePath }.
    */
@@ -370,7 +374,7 @@ export class VaultWriter {
       content = await this.app.vault.adapter.read(normalizedPath);
     } else {
       // File doesn't exist — create with standalone section
-      const newSection = this.formatSummarySection(dateStr, summary, false);
+      const newSection = this.formatSummarySection(dateStr, summary);
       await this.ensureParentFolder(normalizedPath);
       await this.app.vault.create(normalizedPath, newSection);
       return { inserted: true, position: "top", filePath: normalizedPath };
@@ -394,8 +398,17 @@ export class VaultWriter {
     if (hasHeader && !this.zoomBlockIsEmpty(content, dateStr)) {
       // If this exact meeting ID is already written, skip (idempotent re-sync)
       // Otherwise fall through — hasSameDateZoom below will trigger ID-suffix insertion
-      const meetingId = String(summary.meeting_id ?? "");
-      if (!meetingId || content.includes(`(ID: ${meetingId})`)) {
+      const meetingId = String(summary.meeting_id ?? "").trim();
+      if (!meetingId || this.zoomBlockHasMeetingId(content, dateStr, meetingId)) {
+        return { inserted: false, position: "top", filePath: normalizedPath };
+      }
+
+      // Versions before ID markers were added created unmarked Zoom blocks.
+      // When there is exactly one such block for this date, upgrade its
+      // heading in place instead of creating a one-time duplicate.
+      const migrated = this.addMeetingIdToLegacyHeading(content, dateStr, meetingId);
+      if (migrated) {
+        await writeContent(migrated);
         return { inserted: false, position: "top", filePath: normalizedPath };
       }
     }
@@ -404,7 +417,7 @@ export class VaultWriter {
     if (hasHeader && this.zoomBlockIsEmpty(content, dateStr)) {
       content = this.stripZoomBlock(content, dateStr);
       if (!content.trim()) {
-        const newSection = this.formatSummarySection(dateStr, summary, false);
+        const newSection = this.formatSummarySection(dateStr, summary);
         await writeContent(newSection);
         return { inserted: true, position: "top", filePath: normalizedPath };
       }
@@ -456,10 +469,9 @@ export class VaultWriter {
       return { inserted: true, position: "middle", filePath: normalizedPath };
     }
 
-    // Chronological insertion (newest-first)
-    // If same-date Zoom summary exists, add ID suffix to distinguish
-    const needsIdSuffix = hasSameDateZoom;
-    const newSection = this.formatSummarySection(dateStr, summary, needsIdSuffix);
+    // Chronological insertion (newest-first). The generated heading includes
+    // the meeting ID when available, even when another summary has the same date.
+    const newSection = this.formatSummarySection(dateStr, summary);
     let insertLineIdx: number | null = null;
     for (let i = 0; i < lines.length; i++) {
       if (dateRegex.test(lines[i])) {
@@ -526,6 +538,88 @@ export class VaultWriter {
     return false;
   }
 
+  /** Return true when the Zoom heading for this date carries this meeting ID. */
+  private zoomBlockHasMeetingId(
+    content: string,
+    dateStr: string,
+    meetingId: string
+  ): boolean {
+    if (!dateStr || !meetingId) return false;
+
+    const marker = `(ID: ${meetingId})`;
+    const lines = content.split("\n");
+    const dateRegex = /^\d{4}-\d{2}-\d{2}/;
+    let inDateBlock = false;
+
+    for (const line of lines) {
+      if (line.startsWith(dateStr) && dateRegex.test(line)) {
+        inDateBlock = true;
+        if (
+          line.startsWith(`${dateStr} - Zoom AI Summary`) &&
+          line.includes(marker)
+        ) {
+          return true;
+        }
+        continue;
+      }
+      if (!inDateBlock) continue;
+      if (dateRegex.test(line)) break;
+
+      const trimmed = line.trim();
+      if (this.isZoomSummaryLabel(trimmed) && trimmed.includes(marker)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Add an ID to a single unmarked Zoom heading left by an older plugin version.
+   * Multiple unmarked headings are ambiguous, so leave them untouched and let
+   * the normal same-date insertion path create a distinct marked section.
+   */
+  private addMeetingIdToLegacyHeading(
+    content: string,
+    dateStr: string,
+    meetingId: string
+  ): string | null {
+    if (!dateStr || !meetingId) return null;
+
+    const lines = content.split("\n");
+    const dateRegex = /^\d{4}-\d{2}-\d{2}/;
+    const legacyIndices: number[] = [];
+    let inDateBlock = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith(dateStr) && dateRegex.test(line)) {
+        inDateBlock = true;
+        if (
+          line.startsWith(`${dateStr} - Zoom AI Summary`) &&
+          !line.includes("(ID:")
+        ) {
+          legacyIndices.push(i);
+        }
+        continue;
+      }
+      if (!inDateBlock) continue;
+      if (dateRegex.test(line)) break;
+
+      if (line.trim() === "Zoom AI Summary") legacyIndices.push(i);
+    }
+
+    if (legacyIndices.length !== 1) return null;
+
+    const index = legacyIndices[0];
+    lines[index] = `${lines[index]} (ID: ${meetingId})`;
+    return lines.join("\n");
+  }
+
+  private isZoomSummaryLabel(line: string): boolean {
+    return /^Zoom AI Summary(?:\s+\(ID:\s+[^)]+\))?$/.test(line);
+  }
+
   private zoomBlockIsEmpty(content: string, dateStr: string): boolean {
     const lines = content.split("\n");
     const dateRegex = /^\d{4}-\d{2}-\d{2}/;
@@ -559,7 +653,7 @@ export class VaultWriter {
       }
       if (dateRegex.test(lines[i])) break;
       const trimmed = lines[i].trimStart();
-      if (trimmed === "Zoom AI Summary") {
+      if (this.isZoomSummaryLabel(trimmed)) {
         labelIndent = lines[i].substring(0, lines[i].length - trimmed.length);
         labelIdx = i;
         break;
@@ -618,7 +712,7 @@ export class VaultWriter {
       }
       if (dateRegex.test(lines[i])) break;
       const trimmed = lines[i].trimStart();
-      if (trimmed === "Zoom AI Summary") {
+      if (this.isZoomSummaryLabel(trimmed)) {
         labelIndent = lines[i].substring(0, lines[i].length - trimmed.length);
         labelIdx = i;
         break;
@@ -679,7 +773,7 @@ export class VaultWriter {
 
     // If rawId is provided, also require the ID marker — ensures this specific meeting instance
     // was actually synced by the plugin, not just hand-typed notes with the same date header.
-    const hasIdMarker = !rawId || content.includes(`(ID: ${rawId})`);
+    const hasIdMarker = !rawId || this.zoomBlockHasMeetingId(content, dateStr, rawId);
     const result = hasHeader && !isEmpty && hasIdMarker;
     console.log(`[vault][hasExistingSummary] date=${dateStr} rawId=${rawId} standalone=${hasStandaloneHeader} merged=${hasMergedHeader} isEmpty=${isEmpty} hasIdMarker=${hasIdMarker} => ${result}`);
     return result;
