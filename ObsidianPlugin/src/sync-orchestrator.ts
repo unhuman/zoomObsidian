@@ -676,6 +676,7 @@ export class SyncOrchestrator {
     );
 
     // Phase 4: pre-fetch summaries
+    console.error(`[PHASE4-START] active.length=${active.length} with actions: ${active.map((a) => a.action).join(",")}`);
     this.progress(`[Phase 4] Fetching summaries for ${active.length} meetings...`);
     writer.clearFileCache();
     mainWriter?.clearFileCache();
