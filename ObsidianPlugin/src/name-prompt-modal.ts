@@ -33,15 +33,23 @@ export class NamePromptModal extends Modal {
   onOpen() {
     const { contentEl, modalEl } = this;
 
-    // Prevent closing by clicking outside the modal
+    // Disable the default close behavior by removing the close button
+    const closeButton = modalEl.querySelector(".modal-close-button");
+    if (closeButton) {
+      closeButton.remove();
+    }
+
+    // Prevent closing by clicking on the background overlay
+    const handleBackgroundClick = (e: MouseEvent) => {
+      if (e.target === modalEl.parentElement || (e.target as Element)?.classList?.contains("modal-bg")) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+      }
+    };
+
     if (modalEl.parentElement) {
-      const overlay = modalEl.parentElement;
-      overlay.addEventListener("click", (e) => {
-        // Only prevent if clicking the overlay itself, not content inside
-        if (e.target === overlay) {
-          e.stopPropagation();
-        }
-      });
+      modalEl.parentElement.addEventListener("click", handleBackgroundClick, true);
     }
 
     contentEl.createEl("h2", { text: "Identify Meeting Participant" });
