@@ -531,8 +531,12 @@ export class SyncOrchestrator {
         continue;
       }
 
+      // For unresolved "Zoom Meeting" topics, skip exact match and go to prompt logic
+      const isUnresolvedZoomMeeting = /^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0;
+
       // Exact topic match anywhere in vault — route to that file regardless of attendees.
-      if (sourceType === "owned") {
+      // BUT: Skip this for unresolved "Zoom Meeting" topics (they should prompt for identification)
+      if (sourceType === "owned" && !isUnresolvedZoomMeeting) {
         const exactMatch = await writer.findFileByExactName(topic);
         this.throwIfAborted(signal);
         if (exactMatch) {
@@ -595,7 +599,6 @@ export class SyncOrchestrator {
       }
 
       // Skip findPersonFile for unresolved "Zoom Meeting" — go straight to prompt logic
-      const isUnresolvedZoomMeeting = /^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0;
       console.error(`[DEBUG-PHASE3] topic="${topic}" isUnresolvedZoomMeeting=${isUnresolvedZoomMeeting} otherAttendees.length=${otherAttendees.length}`);
       this.dbg(`[phase3-unresolved] topic="${topic}" isUnresolvedZoomMeeting=${isUnresolvedZoomMeeting} otherAttendees.length=${otherAttendees.length} topicMatches=${/^zoom\s+meeting\b/i.test(topic)}`);
       let vaultFile = isUnresolvedZoomMeeting ? null : await writer.findPersonFile(
