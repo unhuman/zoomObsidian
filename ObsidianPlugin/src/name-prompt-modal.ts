@@ -6,6 +6,7 @@ export class NamePromptModal extends Modal {
   private initialName: string;
   private inputValue: string;
   private existingNames: string[];
+  private resolved = false;
 
   constructor(
     app: App,
@@ -20,6 +21,13 @@ export class NamePromptModal extends Modal {
     this.inputValue = initialName;
     this.existingNames = existingNames.sort();
     this.resolve = resolve;
+  }
+
+  private resolveOnce(name: string | null) {
+    if (!this.resolved) {
+      this.resolved = true;
+      this.resolve(name);
+    }
   }
 
   onOpen() {
@@ -70,20 +78,20 @@ export class NamePromptModal extends Modal {
     buttonContainer
       .createEl("button", { text: "Save", cls: "mod-cta" })
       .addEventListener("click", () => {
+        this.resolveOnce(this.inputValue || null);
         this.close();
-        this.resolve(this.inputValue || null);
       });
 
     buttonContainer
       .createEl("button", { text: "Cancel" })
       .addEventListener("click", () => {
+        this.resolveOnce(null);
         this.close();
-        this.resolve(null);
       });
   }
 
   onClose() {
-    this.resolve(null);
+    this.resolveOnce(null);
   }
 
   static prompt(
