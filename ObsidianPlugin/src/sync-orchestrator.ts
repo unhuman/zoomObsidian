@@ -594,12 +594,14 @@ export class SyncOrchestrator {
         continue;
       }
 
-      const vaultFile = await writer.findPersonFile(
+      // Skip findPersonFile for unresolved "Zoom Meeting" — go straight to prompt logic
+      const isUnresolvedZoomMeeting = /^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0;
+      let vaultFile = isUnresolvedZoomMeeting ? null : await writer.findPersonFile(
         topic,
         attendees.length ? attendees : undefined
       );
 
-      if (vaultFile) {
+      if (vaultFile && !isUnresolvedZoomMeeting) {
         plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile, action: "insert" });
       } else {
         // Case A: identified 1:1 meeting (exactly one other attendee) — use primary folder
@@ -630,7 +632,7 @@ export class SyncOrchestrator {
             vaultFile: suggested,
             action: "create",
           });
-        } else if (/^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0) {
+        } else if (isUnresolvedZoomMeeting) {
           // Case B: generic "Zoom Meeting" topic with no attendees resolved — prompt user
           plan.push({
             topic,
