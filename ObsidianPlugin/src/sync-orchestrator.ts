@@ -596,6 +596,7 @@ export class SyncOrchestrator {
 
       // Skip findPersonFile for unresolved "Zoom Meeting" — go straight to prompt logic
       const isUnresolvedZoomMeeting = /^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0;
+      console.error(`[DEBUG-PHASE3] topic="${topic}" isUnresolvedZoomMeeting=${isUnresolvedZoomMeeting} otherAttendees.length=${otherAttendees.length}`);
       this.dbg(`[phase3-unresolved] topic="${topic}" isUnresolvedZoomMeeting=${isUnresolvedZoomMeeting} otherAttendees.length=${otherAttendees.length} topicMatches=${/^zoom\s+meeting\b/i.test(topic)}`);
       let vaultFile = isUnresolvedZoomMeeting ? null : await writer.findPersonFile(
         topic,
