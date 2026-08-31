@@ -114,9 +114,18 @@ export class NamePromptModal extends Modal {
     this.resolveOnce(null);
   }
 
+  close() {
+    // Only allow closing if the modal has been explicitly resolved via a button
+    if (this.resolved) {
+      super.close();
+    }
+    // Otherwise, silently ignore the close request
+  }
+
   onEsc() {
     // Override to prevent closing with Escape key
     // User must click Cancel or Save button
+    return false;
   }
 
   static prompt(
