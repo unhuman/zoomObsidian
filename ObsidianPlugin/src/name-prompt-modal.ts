@@ -94,6 +94,11 @@ export class NamePromptModal extends Modal {
     this.resolveOnce(null);
   }
 
+  onEsc() {
+    // Override to prevent closing with Escape key
+    // User must click Cancel or Save button
+  }
+
   static prompt(
     app: App,
     summaryText: string,
