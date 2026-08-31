@@ -761,9 +761,10 @@ export class SyncOrchestrator {
         continue;
       }
 
-      // Show modal with summary content
+      // Show modal with summary content and list of existing 1:1 names
       const formattedText = writer.formatSummarySection(parsedDate, summary);
-      const enteredName = await NamePromptModal.prompt(this.app, formattedText, "");
+      const existingNames = allFiles.map((f) => f.name);
+      const enteredName = await NamePromptModal.prompt(this.app, formattedText, "", existingNames);
       this.throwIfAborted(signal);
 
       if (!enteredName) {

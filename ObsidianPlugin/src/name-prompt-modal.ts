@@ -5,17 +5,20 @@ export class NamePromptModal extends Modal {
   private summaryText: string;
   private initialName: string;
   private inputValue: string;
+  private existingNames: string[];
 
   constructor(
     app: App,
     summaryText: string,
     initialName: string,
+    existingNames: string[],
     resolve: (name: string | null) => void
   ) {
     super(app);
     this.summaryText = summaryText;
     this.initialName = initialName;
     this.inputValue = initialName;
+    this.existingNames = existingNames.sort();
     this.resolve = resolve;
   }
 
@@ -24,7 +27,7 @@ export class NamePromptModal extends Modal {
     contentEl.createEl("h2", { text: "Identify Meeting Participant" });
 
     contentEl.createEl("p", {
-      text: "Could not automatically identify the other participant. Review the summary below and enter their name:",
+      text: "Could not automatically identify the other participant. Review the summary below and select or enter their name:",
     });
 
     const summaryContainer = contentEl.createDiv({
@@ -32,9 +35,28 @@ export class NamePromptModal extends Modal {
     });
     summaryContainer.createEl("pre", { text: this.summaryText });
 
+    // Dropdown for existing 1:1 files
+    if (this.existingNames.length > 0) {
+      new Setting(contentEl)
+        .setName("Select from existing 1:1s")
+        .setDesc("Or enter a new name below")
+        .addDropdown((dropdown) => {
+          dropdown.addOption("", "-- Select a name --");
+          for (const name of this.existingNames) {
+            dropdown.addOption(name, name);
+          }
+          dropdown.onChange((value) => {
+            if (value) {
+              this.inputValue = value;
+            }
+          });
+        });
+    }
+
+    // Text input for manual entry or override
     new Setting(contentEl)
       .setName("Participant Name")
-      .setDesc("Full name or identifier")
+      .setDesc("Full name or identifier (or type to override dropdown selection)")
       .addText((text) =>
         text
           .setPlaceholder("Enter name...")
@@ -67,10 +89,11 @@ export class NamePromptModal extends Modal {
   static prompt(
     app: App,
     summaryText: string,
-    initialName: string
+    initialName: string,
+    existingNames: string[] = []
   ): Promise<string | null> {
     return new Promise((resolve) => {
-      new NamePromptModal(app, summaryText, initialName, resolve).open();
+      new NamePromptModal(app, summaryText, initialName, existingNames, resolve).open();
     });
   }
 }
