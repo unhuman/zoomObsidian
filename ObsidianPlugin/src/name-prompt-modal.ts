@@ -31,7 +31,19 @@ export class NamePromptModal extends Modal {
   }
 
   onOpen() {
-    const { contentEl } = this;
+    const { contentEl, modalEl } = this;
+
+    // Prevent closing by clicking outside the modal
+    if (modalEl.parentElement) {
+      const overlay = modalEl.parentElement;
+      overlay.addEventListener("click", (e) => {
+        // Only prevent if clicking the overlay itself, not content inside
+        if (e.target === overlay) {
+          e.stopPropagation();
+        }
+      });
+    }
+
     contentEl.createEl("h2", { text: "Identify Meeting Participant" });
 
     contentEl.createEl("p", {
