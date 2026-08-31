@@ -732,6 +732,7 @@ export class SyncOrchestrator {
 
     // Phase 5: write summaries
     this.progress(`[Phase 5] Writing ${active.length} summaries to vault...`);
+    console.error(`[PHASE5-START] active.length=${active.length} actions=${active.map((a) => a.action).join(",")}`);
     let written = 0;
     let skipped = plan.length - active.length;
     let errors = 0;
@@ -740,8 +741,11 @@ export class SyncOrchestrator {
     const toDelete: DeletionTarget[] = [];
 
     // Handle "prompt" actions (user identifies unresolved 2-person "Zoom Meeting")
+    console.error(`[PHASE5-PROMPT-LOOP-START] Processing ${active.length} entries for prompts`);
     for (const planEntry of active) {
+      console.error(`[PHASE5-PROMPT-CHECK] action=${planEntry.action}`);
       if (planEntry.action !== "prompt") continue;
+      console.error(`[PHASE5-PROMPT-FOUND] Processing prompt action`);
       this.throwIfAborted(signal);
 
       const { topic, rawId, parsedDate, dateHint, instanceKey } = planEntry;
