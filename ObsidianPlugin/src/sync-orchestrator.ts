@@ -764,16 +764,20 @@ export class SyncOrchestrator {
       // Show modal with summary content and list of existing 1:1 names
       const formattedText = writer.formatSummarySection(parsedDate, summary);
       const existingNames = allFiles.map((f) => f.name);
+      console.error(`[PROMPT-BEFORE] Showing prompt for topic="${topic}"`);
       const enteredName = await NamePromptModal.prompt(this.app, formattedText, "", existingNames);
+      console.error(`[PROMPT-AFTER] enteredName="${enteredName}" type=${typeof enteredName}`);
       this.throwIfAborted(signal);
 
       if (!enteredName) {
+        console.error(`[PROMPT-SKIP] Skipping because enteredName is falsy: "${enteredName}"`);
         results.push({ topic, status: `SKIP (user declined) @ ${parsedDate}` });
         skipped++;
         continue;
       }
 
       // User entered a name — create file in primary folder
+      console.error(`[PROMPT-CREATE] Creating file for name="${enteredName}" in primary folder`);
       const newPath = writer.suggestNewFilePath(enteredName, [enteredName], true);
       if (!newPath) {
         results.push({ topic, status: `SKIP (invalid name) @ ${parsedDate}` });
