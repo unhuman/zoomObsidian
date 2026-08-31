@@ -336,6 +336,7 @@ export default class ZoomObsidianPlugin extends Plugin {
         sharedMeetingsFolder: this.settings.sharedMeetingsFolder || undefined,
         lastProcessedShared: this.configState.lastProcessedShared,
         myDisplayName: this.settings.myDisplayName || undefined,
+        app: this.app,
       });
 
       // Show progress via Notice

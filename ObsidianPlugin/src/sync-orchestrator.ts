@@ -12,6 +12,7 @@
  *   7. Report results
  */
 
+import type { App } from "obsidian";
 import type { ZoomClient } from "./zoom-client";
 import type { VaultWriter } from "./vault-writer";
 import type { MeetingSummaryItem, MeetingSummaryDetail, ZoomSummaryData } from "./types";
@@ -19,6 +20,7 @@ import { notify } from "./types";
 import { runWithTimeout as runSyncWithTimeout } from "./timeout";
 import { classifyMeetingParticipants } from "./meeting-routing";
 import { runDeletePhase, type DeletionTarget } from "./delete-phase";
+import { NamePromptModal } from "./name-prompt-modal";
 
 export interface SyncPlanEntry {
   topic: string;
@@ -29,7 +31,7 @@ export interface SyncPlanEntry {
   /** Composite key for recurring instances: rawId__parsedDate */
   instanceKey: string;
   vaultFile: string | null;
-  action: "insert" | "create" | "skip";
+  action: "insert" | "create" | "skip" | "prompt";
   /** When true, use the main 1:1 writer instead of the source-specific writer. */
   useMainWriter?: boolean;
 }
@@ -58,6 +60,7 @@ export class SyncOrchestrator {
   private writer: VaultWriter;
   private debug: boolean;
   private sharedMeetingsFolder?: string;
+  private app?: App;
   /** Lowercased first name of the current user, used to filter self from attendee lists. */
   private selfFirstName: string;
 
@@ -79,6 +82,7 @@ export class SyncOrchestrator {
       sharedMeetingsFolder?: string;
       lastProcessedShared?: string;
       myDisplayName?: string;
+      app?: App;
     }
   ) {
     this.client = client;
@@ -86,6 +90,7 @@ export class SyncOrchestrator {
     this.debug = opts?.debug ?? false;
     this.sharedMeetingsFolder = opts?.sharedMeetingsFolder;
     this.lastProcessedShared = opts?.lastProcessedShared;
+    this.app = opts?.app;
     this.selfFirstName = (opts?.myDisplayName ?? "").split(/\s+/)[0].toLowerCase();
   }
 
@@ -597,9 +602,12 @@ export class SyncOrchestrator {
       if (vaultFile) {
         plan.push({ topic, rawId, parsedDate, dateHint: date, instanceKey, vaultFile, action: "insert" });
       } else {
+        // Case A: identified 1:1 meeting (exactly one other attendee) — use primary folder
+        const isTrueTwoPersonMeeting = otherAttendees.length === 1;
         const suggested = writer.suggestNewFilePath(
           topic,
-          attendees.length ? attendees : undefined
+          attendees.length ? attendees : undefined,
+          isTrueTwoPersonMeeting
         );
         if (!suggested) {
           plan.push({
@@ -611,7 +619,30 @@ export class SyncOrchestrator {
             vaultFile: null,
             action: "skip",
           });
+        } else if (isTrueTwoPersonMeeting) {
+          // Case A: attendee known — create in primary folder
+          plan.push({
+            topic,
+            rawId,
+            parsedDate,
+            dateHint: date,
+            instanceKey,
+            vaultFile: suggested,
+            action: "create",
+          });
+        } else if (/^zoom\s+meeting\b/i.test(topic) && otherAttendees.length === 0) {
+          // Case B: generic "Zoom Meeting" topic with no attendees resolved — prompt user
+          plan.push({
+            topic,
+            rawId,
+            parsedDate,
+            dateHint: date,
+            instanceKey,
+            vaultFile: null,
+            action: "prompt",
+          });
         } else {
+          // Named 1:1 with no attendees — create in secondary folder (legacy behavior)
           plan.push({
             topic,
             rawId,
@@ -700,7 +731,81 @@ export class SyncOrchestrator {
     const results: SyncResult[] = [];
     const toDelete: DeletionTarget[] = [];
 
+    // Handle "prompt" actions (user identifies unresolved 2-person "Zoom Meeting")
+    for (const planEntry of active) {
+      if (planEntry.action !== "prompt") continue;
+      this.throwIfAborted(signal);
+
+      const { topic, rawId, parsedDate, dateHint, instanceKey } = planEntry;
+      const summary = this.summaryCache[instanceKey] as ZoomSummaryData | undefined;
+
+      if (!this.app) {
+        this.progress(`[Phase 5] App not available for prompt — skipping "${topic}"`);
+        results.push({ topic, status: `SKIP (no app) @ ${parsedDate}` });
+        skipped++;
+        continue;
+      }
+
+      if (!summary || !writer.hasSummaryContent(summary)) {
+        this.progress(`[Phase 5] No summary for "${topic}" — skipping prompt`);
+        results.push({ topic, status: `SKIP (no summary) @ ${parsedDate}` });
+        skipped++;
+        continue;
+      }
+
+      // Show modal with summary content
+      const formattedText = writer.formatSummarySection(parsedDate, summary);
+      const enteredName = await NamePromptModal.prompt(this.app, formattedText, "");
+      this.throwIfAborted(signal);
+
+      if (!enteredName) {
+        results.push({ topic, status: `SKIP (user declined) @ ${parsedDate}` });
+        skipped++;
+        continue;
+      }
+
+      // User entered a name — create file in primary folder
+      const newPath = writer.suggestNewFilePath(enteredName, [enteredName], true);
+      if (!newPath) {
+        results.push({ topic, status: `SKIP (invalid name) @ ${parsedDate}` });
+        skipped++;
+        continue;
+      }
+
+      try {
+        this.throwIfAborted(signal);
+        const r = await writer.insertSummary(newPath, parsedDate, summary);
+        if (r.inserted) {
+          written++;
+          toDelete.push({ topic, rawId, dateHint });
+          results.push({
+            topic,
+            file: r.filePath,
+            status: `✓ create @ ${parsedDate} (${r.position})`,
+          });
+        } else {
+          skipped++;
+          toDelete.push({ topic, rawId, dateHint });
+          results.push({
+            topic,
+            file: r.filePath,
+            status: `= duplicate @ ${parsedDate}`,
+          });
+        }
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        errors++;
+        results.push({
+          topic,
+          file: newPath,
+          status: `✗ ERROR: ${(e as Error).message}`,
+        });
+      }
+    }
+
     for (const { topic, rawId, parsedDate, dateHint, instanceKey, vaultFile, action, useMainWriter: entryUsesMain } of active) {
+      if (action === "prompt") continue; // Already handled above
+      this.throwIfAborted(signal);
       this.throwIfAborted(signal);
       const entryWriter = entryUsesMain && mainWriter ? mainWriter : writer;
       // Track latest meeting date for scan-date bookkeeping

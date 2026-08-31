@@ -27,3 +27,45 @@
   justify-content: flex-end;
   margin-top: 1em;
 }
+
+.name-prompt-modal-summary {
+  max-height: 60vh;
+  overflow-y: scroll;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 1em;
+  margin: 1em 0;
+  background-color: var(--background-secondary);
+}
+
+.name-prompt-modal-summary pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 0.9em;
+  margin: 0;
+}
+
+.name-prompt-modal-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 1em;
+}
+
+.name-prompt-modal-buttons button {
+  padding: 6px 16px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background-color: var(--background-primary);
+  cursor: pointer;
+}
+
+.name-prompt-modal-buttons button:hover {
+  background-color: var(--background-secondary);
+}
+
+.name-prompt-modal-buttons button.mod-cta {
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}

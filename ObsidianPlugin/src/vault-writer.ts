@@ -146,13 +146,16 @@ export class VaultWriter {
 
   /**
    * Suggest a vault-relative path for a new 1:1 note file.
+   * When usePrimaryFolder is true, use the first folder instead of the second.
    */
   suggestNewFilePath(
     meetingTopic: string,
-    attendeeNames?: string[]
+    attendeeNames?: string[],
+    usePrimaryFolder?: boolean
   ): string | null {
+    const folderIndex = usePrimaryFolder ? 0 : 1;
     const newFilesFolder =
-      this.oneOnOneFolders[1] ?? this.oneOnOneFolders[0] ?? "! One on Ones (Other)";
+      this.oneOnOneFolders[folderIndex] ?? this.oneOnOneFolders[0] ?? "! One on Ones (Other)";
     const base = this.vaultSubfolder
       ? `${this.vaultSubfolder}/${newFilesFolder}`
       : newFilesFolder;
